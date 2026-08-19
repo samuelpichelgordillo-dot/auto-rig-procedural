@@ -1,7 +1,8 @@
 """Módulo 1 — esqueletización de mallas.
 
 1.1: esqueletización en bruto (posiblemente con varias componentes
-     desconectadas).
+     desconectadas) + densificación selectiva de aristas anormalmente
+     largas (recalculadas a mayor resolución solo donde hace falta).
 1.2: fusión de componentes en un único árbol + selección de raíz.
 1.3: simplificación de tramos rectos (Ramer-Douglas-Peucker por tramo,
      entre bifurcaciones/hojas/raíz) + jerarquía padre-hijo.
@@ -33,6 +34,32 @@ import trimesh
 _WAVEFRONT_STEP_SIZE = 2
 
 
+def _load_and_prepare_mesh(mesh_path: str) -> trimesh.Trimesh:
+    """Carga una malla y la deja lista para skeletor.skeletonize.*.
+
+    Los exportadores glTF duplican vértices por cara (normales/UVs
+    distintos por cara plana), así que la malla "en crudo" está partida
+    en cientos de fragmentos de 1 sola cara. Fusionar vértices por
+    posición reconstruye la conectividad real de la superficie, algo
+    imprescindible para que la contracción/skeletonización tenga sentido.
+    """
+    mesh = trimesh.load(mesh_path, force="mesh")
+    mesh.merge_vertices()
+    return mesh
+
+
+def _wavefront_graph(mesh: trimesh.Trimesh, step_size: int) -> nx.Graph:
+    """Ejecuta by_wavefront y devuelve el resultado como networkx.Graph."""
+    skeleton = skeletor.skeletonize.by_wavefront(
+        mesh, waves=1, step_size=step_size, progress=False
+    )
+    graph = nx.Graph()
+    for node_id, position in enumerate(skeleton.vertices):
+        graph.add_node(node_id, pos=tuple(float(c) for c in position))
+    graph.add_edges_from((int(a), int(b)) for a, b in skeleton.edges)
+    return graph
+
+
 def extract_skeleton_graph(mesh_path: str) -> nx.Graph:
     """Carga una malla y devuelve su esqueleto en bruto como grafo.
 
@@ -41,25 +68,92 @@ def extract_skeleton_graph(mesh_path: str) -> nx.Graph:
     (sin ciclos) — la clasificación de raíz/extremidades y la generación
     del Armature se hacen en un paso posterior (Módulo 1.2).
     """
-    mesh = trimesh.load(mesh_path, force="mesh")
+    mesh = _load_and_prepare_mesh(mesh_path)
+    return _wavefront_graph(mesh, _WAVEFRONT_STEP_SIZE)
 
-    # Los exportadores glTF duplican vértices por cara (normales/UVs
-    # distintos por cara plana), así que la malla "en crudo" está partida
-    # en cientos de fragmentos de 1 sola cara. Fusionar vértices por
-    # posición reconstruye la conectividad real de la superficie, algo
-    # imprescindible para que la contracción/skeletonización tenga sentido.
-    mesh.merge_vertices()
 
-    skeleton = skeletor.skeletonize.by_wavefront(
-        mesh, waves=1, step_size=_WAVEFRONT_STEP_SIZE, progress=False
-    )
+def densify_long_edges(
+    graph: nx.Graph,
+    mesh_path: str,
+    threshold_pct: float = 0.10,
+    fine_step_size: int = 1,
+) -> nx.Graph:
+    """Sustituye aristas del grafo en bruto anormalmente largas por el
+    camino real entre sus extremos, tomado de un esqueleto recalculado a
+    mayor resolución.
 
-    graph = nx.Graph()
-    for node_id, position in enumerate(skeleton.vertices):
-        graph.add_node(node_id, pos=tuple(float(c) for c in position))
-    graph.add_edges_from((int(a), int(b)) for a, b in skeleton.edges)
+    ``skeletor.skeletonize.by_wavefront`` calcula internamente un nivel
+    geodésico por vértice (uno por cada salto de arista) y solo lo agrupa
+    en anillos más gruesos si ``step_size > 1`` — esa agrupación ocurre
+    antes de calcular los centros de anillo, así que el nivel de detalle
+    fino no queda accesible en el resultado ya agrupado (ni en
+    ``Skeleton.mesh_map`` ni en ningún otro atributo): hay que recalcular.
 
-    return graph
+    Para cada arista de ``graph`` cuya longitud supere ``threshold_pct`` de
+    la diagonal del modelo, se recalcula ``by_wavefront`` sobre la misma
+    malla con ``fine_step_size`` (por defecto 1, la resolución máxima), se
+    localizan por posición (no por id — los ids no son comparables entre
+    llamadas) los nodos de ese esqueleto fino más cercanos a cada extremo
+    de la arista larga, y se sustituye la arista original por el camino
+    más corto entre ellos en el grafo fino, insertando sus nodos
+    intermedios (con ids nuevos) en ``graph``.
+
+    El esqueleto fino solo se calcula una vez (perezosamente, la primera
+    vez que hace falta) aunque haya varias aristas marcadas, ya que
+    depende únicamente de la malla y de ``fine_step_size``, no de la
+    arista en cuestión.
+    """
+    positions = [graph.nodes[n]["pos"] for n in graph.nodes]
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+    zs = [p[2] for p in positions]
+    diagonal = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+    threshold = threshold_pct * diagonal
+
+    long_edges = [
+        (u, v)
+        for u, v in graph.edges()
+        if math.dist(graph.nodes[u]["pos"], graph.nodes[v]["pos"]) > threshold
+    ]
+    if not long_edges:
+        return graph.copy()
+
+    fine_mesh = _load_and_prepare_mesh(mesh_path)
+    fine_graph = _wavefront_graph(fine_mesh, fine_step_size)
+    fine_positions = {n: fine_graph.nodes[n]["pos"] for n in fine_graph.nodes}
+
+    def nearest_fine_node(target_pos: tuple[float, float, float]) -> int:
+        return min(
+            fine_positions, key=lambda n: math.dist(fine_positions[n], target_pos)
+        )
+
+    densified = graph.copy()
+    next_id = max(graph.nodes) + 1
+
+    for u, v in long_edges:
+        fine_u = nearest_fine_node(graph.nodes[u]["pos"])
+        fine_v = nearest_fine_node(graph.nodes[v]["pos"])
+        if fine_u == fine_v or not nx.has_path(fine_graph, fine_u, fine_v):
+            continue  # nada que insertar, o la malla fina no conecta ambos puntos
+
+        fine_path = nx.shortest_path(fine_graph, fine_u, fine_v)
+        intermediate_fine_nodes = fine_path[1:-1]
+        if not intermediate_fine_nodes:
+            continue  # el camino fino no aporta nodos intermedios: nada que hacer
+
+        densified.remove_edge(u, v)
+
+        chain = [u]
+        for fine_node in intermediate_fine_nodes:
+            new_id = next_id
+            next_id += 1
+            densified.add_node(new_id, pos=fine_positions[fine_node])
+            chain.append(new_id)
+        chain.append(v)
+
+        densified.add_edges_from(zip(chain, chain[1:]))
+
+    return densified
 
 
 def _closest_pair(

@@ -14,7 +14,8 @@ conversión de ejes se aplica aquí, antes de que ese script cree ningún
 hueso, tal como pide el sub-paso 1.4.
 
 Reproduce exactamente el mismo pipeline y los mismos parámetros
-(umbral de arista casi-cero, tolerancia RDP: 0.5% de la diagonal) que
+(umbral de arista larga a densificar: 10% de la diagonal; umbral de
+arista casi-cero y tolerancia RDP: 0.5% de la diagonal) que
 backend/scripts/inspect_skeleton.py, para que el Armature resultante
 corresponda al esqueleto ya diagnosticado en los pasos anteriores.
 
@@ -33,12 +34,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.app.skeletonization import (
     build_hierarchy,
     collapse_short_edges,
+    densify_long_edges,
     extract_skeleton_graph,
     merge_components,
     select_root,
     simplify_chains_rdp,
 )
 
+_LONG_EDGE_THRESHOLD_PCT = 0.10
 _SHORT_EDGE_THRESHOLD_PCT = 0.005
 _RDP_TOLERANCE_PCT = 0.005
 
@@ -50,7 +53,10 @@ def gltf_to_blender(position: tuple[float, float, float]) -> tuple[float, float,
 
 def main(mesh_path: str, out_path: str) -> None:
     graph = extract_skeleton_graph(mesh_path)
-    merged = merge_components(graph)
+    densified = densify_long_edges(
+        graph, mesh_path, threshold_pct=_LONG_EDGE_THRESHOLD_PCT
+    )
+    merged = merge_components(densified)
     root = select_root(merged)
 
     positions = [merged.nodes[n]["pos"] for n in merged.nodes]

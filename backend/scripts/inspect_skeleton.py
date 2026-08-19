@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from backend.app.skeletonization import (
     build_hierarchy,
     collapse_short_edges,
+    densify_long_edges,
     extract_skeleton_graph,
     merge_components,
     select_root,
@@ -29,6 +30,12 @@ from backend.app.skeletonization import (
 # tratamiento especial más adelante (fusionar con el padre, descartar, etc.
 # — todavía no decidido, solo se detecta aquí).
 _SHORT_BONE_THRESHOLD_PCT = 0.005
+
+# Umbral para marcar aristas del grafo EN BRUTO anormalmente largas
+# (densify_long_edges las sustituye por el camino real, recalculado a
+# mayor resolución). Punto de partida tras revisar la distribución de
+# longitudes de los 3 modelos — ver histórico de commits para los datos.
+_LONG_EDGE_THRESHOLD_PCT = 0.10
 
 # Tolerancia de Ramer-Douglas-Peucker para simplificar tramos rectos: un
 # punto intermedio de un tramo sobrevive si se desvía más de este % de la
@@ -142,8 +149,41 @@ def main(mesh_path: str) -> None:
             f"distancia={data['weight']:.4f}"
         )
 
+    # --- 1.1b: densificación selectiva de aristas en bruto anormalmente
+    # largas (antes de fusión/colapso/RDP, para que esos pasos actúen ya
+    # sobre el grafo densificado) ---
+    raw_positions = [graph.nodes[n]["pos"] for n in graph.nodes]
+    raw_xs = [p[0] for p in raw_positions]
+    raw_ys = [p[1] for p in raw_positions]
+    raw_zs = [p[2] for p in raw_positions]
+    raw_diagonal = math.dist(
+        (min(raw_xs), min(raw_ys), min(raw_zs)),
+        (max(raw_xs), max(raw_ys), max(raw_zs)),
+    )
+    long_edge_threshold = _LONG_EDGE_THRESHOLD_PCT * raw_diagonal
+    long_edges_before = [
+        (u, v)
+        for u, v in graph.edges()
+        if math.dist(graph.nodes[u]["pos"], graph.nodes[v]["pos"]) > long_edge_threshold
+    ]
+    densified = densify_long_edges(
+        graph, mesh_path, threshold_pct=_LONG_EDGE_THRESHOLD_PCT
+    )
+
+    print()
+    print(
+        f"--- Densificación (1.1b): aristas > {_LONG_EDGE_THRESHOLD_PCT * 100:.0f}% "
+        "de la diagonal, sustituidas por el camino fino real ---"
+    )
+    print(f"Aristas marcadas: {len(long_edges_before)}")
+    for u, v in long_edges_before:
+        print(f"  {u} -> {v}")
+    print(f"Nodos antes de densificar: {graph.number_of_nodes()}")
+    print(f"Nodos después de densificar: {densified.number_of_nodes()}")
+    print(f"Nodos intermedios insertados: {densified.number_of_nodes() - graph.number_of_nodes()}")
+
     # --- 1.2: fusión real de componentes + selección de raíz ---
-    merged = merge_components(graph)
+    merged = merge_components(densified)
     root = select_root(merged)
     root_pos = merged.nodes[root]["pos"]
     root_degree = merged.degree[root]
