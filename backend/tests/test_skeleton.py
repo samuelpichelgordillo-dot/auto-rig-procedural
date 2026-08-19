@@ -2,35 +2,25 @@
 
 Cubre lo ya verificado manualmente en las sesiones de desarrollo (ver
 CLAUDE.md): tras el pipeline completo (extract -> densify -> merge ->
-root -> collapse -> RDP -> hierarchy) sobre cow/biped/bat, el resultado es
-un único árbol conexo y sin ciclos, con raíz no trivial y sin aristas por
-debajo del umbral de longitud mínima.
+root -> punto fijo collapse/RDP -> hierarchy) sobre cow/biped/bat, el
+resultado es un único árbol conexo y sin ciclos, con raíz no trivial y
+sin aristas por debajo del umbral de longitud mínima.
 """
 from __future__ import annotations
 
+import logging
 import math
+import re
 from pathlib import Path
 
 import networkx as nx
 import pytest
 
-from backend.app.skeletonization import (
-    build_hierarchy,
-    collapse_short_edges,
-    densify_long_edges,
-    extract_skeleton_graph,
-    merge_components,
-    select_root,
-    simplify_chains_rdp,
-)
+from backend.app.skeletonization import build_skeleton_tree
 
 _SAMPLES_DIR = Path(__file__).resolve().parents[2] / "samples"
 
-# Mismos parámetros que backend/scripts/inspect_skeleton.py, para que estos
-# tests describan exactamente el pipeline ya verificado a mano.
-_LONG_EDGE_THRESHOLD_PCT = 0.10
 _SHORT_EDGE_THRESHOLD_PCT = 0.005
-_RDP_TOLERANCE_PCT = 0.005
 
 # Nº de nodos finales de la última ejecución verificada manualmente (ver
 # CLAUDE.md, checkpoint del Módulo 1). ±20% como rango de tolerancia: basta
@@ -38,22 +28,11 @@ _RDP_TOLERANCE_PCT = 0.005
 # de skeletor/parámetros entre entornos.
 _EXPECTED_FINAL_NODES = {
     "cow_unrigged.glb": 28,
-    "biped_unrigged.glb": 183,
+    "biped_unrigged.glb": 182,
     "bat_unrigged.glb": 30,
 }
 
-# biped_unrigged.glb deja 1 arista residual por debajo del umbral de
-# longitud mínima (padre=78, hijo=12, ~0.0042) que collapse_short_edges +
-# simplify_chains_rdp no eliminan — detectado y documentado ya en el
-# desarrollo del Módulo 1, pendiente de tratamiento específico (fusionar
-# con el padre, descartar, etc. — no decidido). Se permite explícitamente
-# aquí en vez de silenciar el test o esconder el caso: si aparece una
-# segunda arista corta, o aparece en cow/bat, el test debe seguir fallando.
-_KNOWN_SHORT_EDGE_EXCEPTIONS = {
-    "cow_unrigged.glb": 0,
-    "biped_unrigged.glb": 1,
-    "bat_unrigged.glb": 0,
-}
+_MAX_CONVERGENCE_ITERS = 5
 
 
 def _bbox_diagonal(graph: nx.Graph) -> float:
@@ -64,32 +43,11 @@ def _bbox_diagonal(graph: nx.Graph) -> float:
     return math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
 
 
-def _run_pipeline(mesh_path: str):
-    """Reproduce el pipeline completo del Módulo 1 (1.1 - 1.3)."""
-    graph = extract_skeleton_graph(mesh_path)
-    densified = densify_long_edges(
-        graph, mesh_path, threshold_pct=_LONG_EDGE_THRESHOLD_PCT
-    )
-    merged = merge_components(densified)
-    root = select_root(merged)
-
-    diagonal = _bbox_diagonal(merged)
-    short_threshold = _SHORT_EDGE_THRESHOLD_PCT * diagonal
-    rdp_tolerance = _RDP_TOLERANCE_PCT * diagonal
-
-    collapsed = collapse_short_edges(merged, root, short_threshold)
-    simplified = simplify_chains_rdp(collapsed, root, rdp_tolerance)
-    hierarchy = build_hierarchy(simplified, root)
-
-    return simplified, root, hierarchy, short_threshold
-
-
 @pytest.fixture(params=sorted(_EXPECTED_FINAL_NODES), scope="module")
 def pipeline_result(request):
     mesh_name = request.param
-    tree, root, hierarchy, short_threshold = _run_pipeline(
-        str(_SAMPLES_DIR / mesh_name)
-    )
+    tree, root, hierarchy = build_skeleton_tree(str(_SAMPLES_DIR / mesh_name))
+    short_threshold = _SHORT_EDGE_THRESHOLD_PCT * _bbox_diagonal(tree)
     return mesh_name, tree, root, hierarchy, short_threshold
 
 
@@ -108,7 +66,7 @@ def test_root_has_degree_at_least_three(pipeline_result):
     assert tree.degree[root] >= 3
 
 
-def test_no_unexpected_edges_below_minimum_length(pipeline_result):
+def test_no_edges_below_minimum_length(pipeline_result):
     mesh_name, tree, _, hierarchy, short_threshold = pipeline_result
     short_edges = []
     for child, parent in hierarchy.items():
@@ -118,10 +76,9 @@ def test_no_unexpected_edges_below_minimum_length(pipeline_result):
         if length < short_threshold:
             short_edges.append((parent, child, length))
 
-    allowed = _KNOWN_SHORT_EDGE_EXCEPTIONS[mesh_name]
-    assert len(short_edges) <= allowed, (
+    assert not short_edges, (
         f"{mesh_name}: {len(short_edges)} aristas por debajo del umbral "
-        f"{short_threshold:.6f} (se permiten {allowed} conocidas): {short_edges}"
+        f"{short_threshold:.6f}: {short_edges}"
     )
 
 
@@ -133,4 +90,30 @@ def test_final_node_count_within_expected_range(pipeline_result):
     assert low <= n_nodes <= high, (
         f"{mesh_name}: {n_nodes} nodos finales, fuera del rango esperado "
         f"[{low:.0f}, {high:.0f}] (referencia: {expected})"
+    )
+
+
+@pytest.mark.parametrize("mesh_name", sorted(_EXPECTED_FINAL_NODES))
+def test_converges_within_few_iterations(mesh_name, caplog):
+    """build_skeleton_tree no expone el nº de rondas del punto fijo en su
+    valor de retorno (firma deliberadamente simple) — lo registra vía
+    ``logging``, así que este test lo lee de ahí en vez de cambiar la API
+    pública solo para poder probarlo.
+    """
+    with caplog.at_level(logging.INFO, logger="backend.app.skeletonization"):
+        build_skeleton_tree(str(_SAMPLES_DIR / mesh_name))
+
+    match = None
+    for record in caplog.records:
+        found = re.search(r"convergió en (\d+) ronda", record.getMessage())
+        if found:
+            match = found
+    assert match is not None, (
+        f"{mesh_name}: no se encontró el mensaje de convergencia en los logs"
+    )
+
+    iterations = int(match.group(1))
+    assert 1 <= iterations <= _MAX_CONVERGENCE_ITERS, (
+        f"{mesh_name}: convergió en {iterations} rondas, "
+        f"fuera del límite esperado ({_MAX_CONVERGENCE_ITERS})"
     )

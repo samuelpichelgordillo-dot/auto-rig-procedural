@@ -191,13 +191,6 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
     accesible en el resultado ya agrupado (ni `mesh_map` ni ningún otro
     atributo de una sola llamada); hay que recalcular a menor step_size
     si se necesita.
-  - Limitación conocida, sin resolver: `biped_unrigged` deja 1 arista
-    residual por debajo del umbral de longitud mínima (padre=78, hijo=12,
-    ~0.0042) que ni `collapse_short_edges` ni `simplify_chains_rdp`
-    eliminan — documentada explícitamente en
-    `test_no_unexpected_edges_below_minimum_length` como excepción
-    conocida (no oculta), pendiente de tratamiento específico antes de
-    generar el `Armature` de producción.
   - Generación de `Armature` real + conversión de ejes glTF→Blender
     (`Blender_X=gltf_X, Blender_Y=-gltf_Z, Blender_Z=gltf_Y`) validada
     visualmente en `backend/scripts/_render_armature_debug.py` +
@@ -206,3 +199,38 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
     producción (eso corresponde a un módulo posterior).
 
   Verificación: `pytest backend/tests/test_skeleton.py` → 15 passed.
+
+- **[Módulo 1 — cierre] 2026-08-19** — `build_skeleton_tree(mesh_path, ...)`
+  añadida en `backend/app/skeletonization.py`: encapsula el pipeline
+  completo (`extract_skeleton_graph` → `densify_long_edges` →
+  `merge_components` → `select_root`, seguido de un bucle de punto fijo
+  que alterna `collapse_short_edges`/`simplify_chains_rdp` hasta que una
+  ronda completa no cambie ni nodos ni aristas, y termina con
+  `build_hierarchy`). Sustituye la lógica duplicada que antes vivía por
+  separado en `backend/tests/test_skeleton.py`,
+  `backend/scripts/inspect_skeleton.py` y
+  `backend/scripts/_export_skeleton_json.py`.
+
+  **Causa raíz de la arista residual de `biped_unrigged`** (la limitación
+  conocida del checkpoint anterior, ahora resuelta): `collapse_short_edges`
+  y `simplify_chains_rdp` se ejecutaban una sola vez cada uno, en ese
+  orden. Pero `simplify_chains_rdp` puede acercar directamente dos
+  anclajes (bifurcaciones/hojas) que antes no eran vecinos, al quitar los
+  nodos intermedios de grado 2 entre ellos — y esa arista nueva puede
+  quedar por debajo del umbral de longitud mínima sin que nadie vuelva a
+  comprobarlo, porque `collapse_short_edges` ya había terminado su única
+  pasada. El fix es alternar ambos pasos en un bucle `while changed` (con
+  `max_iters=20` como cinturón de seguridad, nunca alcanzado en la
+  práctica) hasta alcanzar un punto fijo real. Verificado por logging:
+  cow y bat convergen en 2 rondas, biped en 3 — muy por debajo del límite
+  de 5 usado en el test de convergencia.
+
+  `biped_unrigged` pasa de 183 a **182** nodos finales tras el fix (una
+  fusión más, la que antes se quedaba pendiente), y de **1 arista residual
+  a 0** — ya no hace falta ninguna excepción documentada en el test.
+
+  Módulo 1 cerrado formalmente sin pendientes conocidos: los 3 modelos dan
+  árbol único, conexo, acíclico, raíz de grado ≥3, sin aristas por debajo
+  del umbral, y el bucle de punto fijo converge en pocas rondas en los 3.
+
+  Verificación: `pytest` completo → 20 passed, 0 failed.

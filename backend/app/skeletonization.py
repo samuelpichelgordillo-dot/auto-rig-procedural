@@ -12,11 +12,14 @@ todavía no implementado aquí.
 from __future__ import annotations
 
 import collections
+import logging
 import math
 
 import networkx as nx
 import skeletor
 import trimesh
+
+logger = logging.getLogger(__name__)
 
 # step_size de skeletor.skeletonize.by_wavefront: agrupa `step_size` anillos
 # geodésicos consecutivos en un único nodo. A diferencia de un umbral de
@@ -479,3 +482,82 @@ def build_hierarchy(tree: nx.Graph, root: int) -> dict[int, int | None]:
                 parent[neighbor] = current
                 queue.append(neighbor)
     return parent
+
+
+def build_skeleton_tree(
+    mesh_path: str,
+    *,
+    long_edge_pct: float = 0.10,
+    short_edge_pct: float = 0.005,
+    rdp_tolerance_pct: float = 0.005,
+    max_iters: int = 20,
+) -> tuple[nx.Graph, int, dict[int, int | None]]:
+    """Pipeline completo del Módulo 1 (1.1 - 1.3): de una malla a un árbol
+    de esqueleto listo para construir el Armature (Módulo 1.4 en adelante).
+
+    1. ``extract_skeleton_graph`` -> ``densify_long_edges`` ->
+       ``merge_components`` -> ``select_root`` — una sola vez.
+    2. Punto fijo alternando ``collapse_short_edges`` y
+       ``simplify_chains_rdp``: una sola pasada de cada uno no bastaba
+       para eliminar todas las aristas por debajo del umbral de longitud
+       mínima. Causa raíz (detectada al escribir el test del Módulo 1):
+       ``simplify_chains_rdp`` puede acercar directamente dos anclajes que
+       antes no eran vecinos (al quitar los nodos intermedios de grado 2
+       entre ellos), y esa nueva arista puede quedar por debajo del
+       umbral — pero ``collapse_short_edges`` ya se había ejecutado antes,
+       así que nadie la vuelve a comprobar. Alternar ambos pasos hasta que
+       una ronda completa no cambie ni el conjunto de nodos ni el de
+       aristas sí converge (mismo patrón ``while changed`` que ya usa
+       ``collapse_short_edges`` internamente, pero aquí a nivel de los dos
+       pasos combinados).
+    3. ``build_hierarchy``.
+
+    El nº de rondas hasta converger se registra vía ``logging`` (no se
+    expone en el valor de retorno, para mantener la firma simple). Si no
+    converge en ``max_iters`` rondas, lanza ``RuntimeError`` — cinturón de
+    seguridad, no debería ocurrir nunca dado el nº de nodos con el que
+    trabajamos.
+    """
+    graph = extract_skeleton_graph(mesh_path)
+    densified = densify_long_edges(graph, mesh_path, threshold_pct=long_edge_pct)
+    merged = merge_components(densified)
+    root = select_root(merged)
+
+    positions = [merged.nodes[n]["pos"] for n in merged.nodes]
+    xs = [p[0] for p in positions]
+    ys = [p[1] for p in positions]
+    zs = [p[2] for p in positions]
+    diagonal = math.dist((min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs)))
+    short_threshold = short_edge_pct * diagonal
+    rdp_tolerance = rdp_tolerance_pct * diagonal
+
+    tree = merged
+    for iteration in range(1, max_iters + 1):
+        before_nodes = frozenset(tree.nodes)
+        before_edges = frozenset(frozenset(edge) for edge in tree.edges)
+
+        tree = collapse_short_edges(tree, root, short_threshold)
+        tree = simplify_chains_rdp(tree, root, rdp_tolerance)
+
+        after_nodes = frozenset(tree.nodes)
+        after_edges = frozenset(frozenset(edge) for edge in tree.edges)
+
+        if before_nodes == after_nodes and before_edges == after_edges:
+            logger.info(
+                "build_skeleton_tree(%s): convergió en %d ronda(s) de "
+                "collapse_short_edges/simplify_chains_rdp",
+                mesh_path,
+                iteration,
+            )
+            break
+    else:
+        raise RuntimeError(
+            f"build_skeleton_tree: no convergió en {max_iters} rondas de "
+            "collapse_short_edges/simplify_chains_rdp para "
+            f"{mesh_path!r}. No debería ocurrir dado el nº de nodos "
+            "habitual — revisar si hay un ciclo de oscilación entre "
+            "ambos pasos."
+        )
+
+    hierarchy = build_hierarchy(tree, root)
+    return tree, root, hierarchy
