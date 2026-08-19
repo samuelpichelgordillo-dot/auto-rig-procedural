@@ -31,6 +31,9 @@ from pathlib import Path
 import bpy
 import mathutils
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from backend.scripts.build_armature import create_armature
+
 args = sys.argv[sys.argv.index("--") + 1:]
 if len(args) != 4:
     print(
@@ -52,31 +55,10 @@ edges = skeleton_data["edges"]  # lista de [parent_id, child_id]
 bpy.ops.wm.read_factory_settings(use_empty=True)
 bpy.ops.import_scene.gltf(filepath=glb_path)
 
-# --- 1. Armature real, con la jerarquía calculada en 1.1-1.3 ---
-armature_data = bpy.data.armatures.new("SkeletonArmature")
-armature_obj = bpy.data.objects.new("SkeletonArmature", armature_data)
-bpy.context.collection.objects.link(armature_obj)
-armature_data.display_type = "OCTAHEDRAL"
-armature_obj.show_in_front = True
-
-bpy.context.view_layer.objects.active = armature_obj
-bpy.ops.object.mode_set(mode="EDIT")
-
-edit_bones = armature_data.edit_bones
-bone_by_child: dict[int, "bpy.types.EditBone"] = {}
-for parent_id, child_id in edges:
-    bone = edit_bones.new(f"bone_{parent_id}_{child_id}")
-    bone.head = node_positions[parent_id]
-    bone.tail = node_positions[child_id]
-    bone_by_child[child_id] = bone
-
-for parent_id, child_id in edges:
-    bone = bone_by_child[child_id]
-    if parent_id in bone_by_child:
-        bone.parent = bone_by_child[parent_id]
-        bone.use_connect = True
-
-bpy.ops.object.mode_set(mode="OBJECT")
+# --- 1. Armature real, con la jerarquía calculada en 1.1-1.3 (factorizada
+#    en build_armature.py para no duplicarla entre el script de producción
+#    y este de depuración) ---
+armature_obj = create_armature(node_positions, edges)
 
 # --- 1b. Malla del cuerpo semi-transparente: el esqueleto sigue el eje
 #    medial interno de la malla, así que con la malla opaca casi todos los

@@ -250,8 +250,14 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   (posiciones ya en ejes Blender vía la nueva `gltf_to_blender`, movida de
   `_export_skeleton_json.py` a `skeletonization.py` por estar ahora
   usada en 2 sitios) y reinvoca Blender como subproceso para construir el
-  Armature (`create_armature`, factorizada de `_render_armature_debug.py`
-  para no duplicarla), parentear con auto-weight y exportar.
+  Armature (`create_armature`), parentear con auto-weight y exportar.
+
+  Nota de corrección (2026-08-19, mismo día): este checkpoint afirmaba que
+  `create_armature` había sido "factorizada de `_render_armature_debug.py`
+  para no duplicarla" — eso NO ocurrió en este commit: `create_armature`
+  se escribió de nuevo en `build_armature.py`, pero `_render_armature_debug.py`
+  se quedó con su propia construcción de edit bones inline, duplicada. Ver
+  el checkpoint siguiente para el fix real.
 
   **Bug real encontrado y corregido durante el desarrollo:** con la malla
   tal como la importa Blender (vértices duplicados por cara, igual
@@ -274,3 +280,16 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
 
   Sin tests automatizados todavía (se decidió deliberadamente: dependen de
   cómo se procesen los pesos en bruto, tarea siguiente).
+
+- **[Módulo 2 — fix de duplicación] 2026-08-19** — `_render_armature_debug.py`
+  seguía con su propia construcción de edit bones inline (duplicada de
+  `create_armature` en `build_armature.py`), pese a lo que afirmaba el
+  checkpoint anterior. Corregido: ahora importa `create_armature` desde
+  `backend.scripts.build_armature` (mismo patrón de `sys.path.insert` que
+  ya usan el resto de scripts para importar desde `backend/`) y su bloque
+  inline (`bpy.data.armatures.new`, `edit_bones.new`, `parent`/`use_connect`)
+  se eliminó. Comportamiento verificado sin cambios: mismo comando de uso,
+  render manual sobre los 3 modelos (vía Blender headless) con resultado
+  visual idéntico al ya generado (tamaños de PNG iguales o casi iguales;
+  biped_unrigged difiere en <100 bytes por variación normal de encoding
+  PNG entre ejecuciones, no en contenido — comparado visualmente).
