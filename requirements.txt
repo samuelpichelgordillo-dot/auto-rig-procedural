@@ -2,3 +2,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pytest>=8.0
 httpx>=0.27
+skeletor>=1.4
+networkx>=3.2
+trimesh>=4.0
