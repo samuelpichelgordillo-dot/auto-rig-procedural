@@ -28,12 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.app.skeletonization import build_skeleton_tree
-
-
-def gltf_to_blender(position: tuple[float, float, float]) -> tuple[float, float, float]:
-    x, y, z = position
-    return (x, -z, y)
+from backend.app.skeletonization import build_skeleton_tree, gltf_to_blender
 
 
 def main(mesh_path: str, out_path: str) -> None:

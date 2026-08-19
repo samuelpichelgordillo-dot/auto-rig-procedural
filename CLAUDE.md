@@ -42,8 +42,10 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 2 — Skinning (siguiente a iniciar)
-- **Estado:** Módulo 1 completado y verificado
+- **Módulo actual:** 2 — Skinning (en curso)
+- **Estado:** Módulo 1 completado y verificado. Módulo 2: Armature real +
+  auto-weight en bruto hechos; falta post-proceso de pesos + test de
+  deformación antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -234,3 +236,41 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   del umbral, y el bucle de punto fijo converge en pocas rondas en los 3.
 
   Verificación: `pytest` completo → 20 passed, 0 failed.
+
+- **[Módulo 2 — sub-paso, en curso] 2026-08-19** — Armature real +
+  parentado con auto-weight nativo de Blender (`ARMATURE_AUTO`, difusión
+  de calor) sobre los 3 samples. **Módulo 2 NO cerrado**: falta el
+  post-proceso de pesos (máx. 4 influencias/vértice, normalizado,
+  suavizado) y su test de deformación — pendiente para la siguiente
+  sesión, una vez revisados estos pesos en bruto.
+
+  `backend/scripts/build_armature.py` (producción, sin prefijo `_`):
+  mismo patrón dual-modo que `inspect_glb.py` — calcula el esqueleto con
+  `build_skeleton_tree` en Python de sistema, lo serializa a JSON temporal
+  (posiciones ya en ejes Blender vía la nueva `gltf_to_blender`, movida de
+  `_export_skeleton_json.py` a `skeletonization.py` por estar ahora
+  usada en 2 sitios) y reinvoca Blender como subproceso para construir el
+  Armature (`create_armature`, factorizada de `_render_armature_debug.py`
+  para no duplicarla), parentear con auto-weight y exportar.
+
+  **Bug real encontrado y corregido durante el desarrollo:** con la malla
+  tal como la importa Blender (vértices duplicados por cara, igual
+  problema que motivó `merge_vertices` en `skeletonization.py` para el
+  cálculo del esqueleto), `bpy.ops.object.parent_set(type='ARMATURE_AUTO')`
+  creaba los vertex groups pero la difusión de calor no asignaba peso a
+  NINGÚN vértice (0/1616 en cow) — sin conectividad real de superficie
+  (islas de 1 cara), el calor no tiene por dónde propagarse. El exportador
+  glTF entonces ni siquiera escribía datos de skin ("Cow has no skin").
+  Fix: `bpy.ops.mesh.remove_doubles()` en cada malla antes de parentear
+  (mismo criterio que `merge_vertices`, ahora en el lado de Blender).
+  Verificado tras el fix: 100% de vértices con peso asignado en los 3
+  modelos, Armature real (no Empties) y parentado correcto al reimportar
+  el GLB exportado.
+
+  Generados `samples/_debug/{cow,biped,bat}_rigged.glb` y sus renders de
+  depuración `samples/_debug/{cow,biped,bat}_rigged_{front,side}.png` (vía
+  `backend/scripts/_render_rigged_debug.py`, que lee el Armature ya
+  presente en el GLB rigged en vez de recalcular nada).
+
+  Sin tests automatizados todavía (se decidió deliberadamente: dependen de
+  cómo se procesen los pesos en bruto, tarea siguiente).

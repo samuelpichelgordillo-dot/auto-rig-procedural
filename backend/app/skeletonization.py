@@ -561,3 +561,18 @@ def build_skeleton_tree(
 
     hierarchy = build_hierarchy(tree, root)
     return tree, root, hierarchy
+
+
+def gltf_to_blender(
+    position: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Convierte una posición de ejes glTF (Y-up) a ejes Blender (Z-up):
+    Blender_X = gltf_X, Blender_Y = -gltf_Z, Blender_Z = gltf_Y.
+
+    Usada por cualquier script que vaya a crear geometría/huesos en
+    Blender a partir de posiciones calculadas aquí (que están siempre en
+    ejes glTF, el espacio en el que trabaja todo este módulo) — aplicar
+    antes de crear ningún hueso u objeto en la escena de Blender.
+    """
+    x, y, z = position
+    return (x, -z, y)
