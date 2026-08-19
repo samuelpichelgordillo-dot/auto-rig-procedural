@@ -82,18 +82,28 @@ bpy.ops.object.mode_set(mode="OBJECT")
 #    medial interno de la malla, así que con la malla opaca casi todos los
 #    huesos quedarían ocultos dentro del cuerpo (comprobado: un primer
 #    render con la malla opaca solo dejaba ver huesos en dedos y siluetas).
-#    Se baja el alpha de cada material importado para poder ver el
-#    esqueleto a través del cuerpo.
+#
+#    Se sustituyen TODOS los materiales importados por uno propio, simple
+#    y semi-transparente, en vez de solo bajar el alpha del material
+#    original: se comprobó que en cow_unrigged/bat_unrigged los materiales
+#    originales (con un nodo "Color Attribute" que aparentemente referencia
+#    datos de color de vértice ausentes tras el paso por _strip_rig.py)
+#    renderizan negro puro incluso completamente opacos, sin relación con
+#    el alpha — bajarles el alpha solo los hacía invisibles. Con un
+#    material nuevo (Base Color gris plano) se evita depender del grafo de
+#    shader original, que no es relevante para esta visualización.
+debug_material = bpy.data.materials.new(name="DebugBodyMaterial")
+debug_material.use_nodes = True
+debug_material.surface_render_method = "BLENDED"
+debug_bsdf = debug_material.node_tree.nodes.get("Principled BSDF")
+debug_bsdf.inputs["Base Color"].default_value = (0.6, 0.6, 0.6, 1.0)
+debug_bsdf.inputs["Alpha"].default_value = 0.25
+
 for obj in bpy.data.objects:
     if obj.type != "MESH":
         continue
-    for material in obj.data.materials:
-        if material is None or not material.use_nodes:
-            continue
-        material.surface_render_method = "BLENDED"
-        principled = material.node_tree.nodes.get("Principled BSDF")
-        if principled is not None and "Alpha" in principled.inputs:
-            principled.inputs["Alpha"].default_value = 0.25
+    obj.data.materials.clear()
+    obj.data.materials.append(debug_material)
 
 # --- 2. Geometría auxiliar SOLO para que los huesos aparezcan en el render
 #    final (ver nota técnica en el docstring del módulo) ---
