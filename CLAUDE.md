@@ -42,8 +42,8 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 1 — Detección de esqueleto (siguiente a iniciar)
-- **Estado:** Módulo 0 completado y verificado
+- **Módulo actual:** 2 — Skinning (siguiente a iniciar)
+- **Estado:** Módulo 1 completado y verificado
 
 ## Roadmap por módulos
 
@@ -143,3 +143,66 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   calcular el bounding box. Relevante para el Módulo 1: cualquier código que
   itere `bpy.data.objects` tras un `import_scene.gltf` con armature debe
   aplicar el mismo filtro.
+
+- **[Módulo 1] 2026-08-19** — Pipeline de esqueletización completo sobre
+  los 3 samples (cow/biped/bat_unrigged.glb), implementado en
+  `backend/app/skeletonization.py` y verificado con
+  `backend/tests/test_skeleton.py` (15 tests, todos en verde).
+
+  **Pipeline final (1.1 → 1.3):**
+  1. `extract_skeleton_graph` — carga la malla con trimesh (`merge_vertices`
+     imprescindible: los exportadores glTF duplican vértices por cara y
+     dejan la malla partida en cientos de fragmentos de 1 cara) y la
+     esqueletiza con `skeletor.skeletonize.by_wavefront` (step_size=2;
+     step_size=1 se probó como arreglo global y se descartó — no resolvía
+     el problema de fondo en cow y metía ruido en biped/bat).
+  2. `densify_long_edges` — para aristas del grafo en bruto que superen el
+     10% de la diagonal del modelo, recalcula `by_wavefront` a step_size=1
+     y sustituye la arista por el camino real entre sus extremos.
+  3. `merge_components` — fusiona las componentes conexas del esqueleto en
+     bruto (frecuentes: partes de malla no soldadas) en un único árbol vía
+     MST entre componentes (peso = distancia mínima punto-a-punto).
+  4. `select_root` — centroide de grafo (minimiza el mayor sub-árbol tras
+     quitar el nodo), no centroide espacial (ese caía en manos/alas en vez
+     de en el torso).
+  5. `collapse_short_edges` — colapsa aristas por debajo del 0.5% de la
+     diagonal, cualquier grado (no solo grado 2): imprescindible tras
+     detectar geometría solapada real en la malla del bípedo (mano/guante
+     con dos capas casi coincidentes, confirmado con análisis de hulls
+     convexos y vértices compartidos).
+  6. `simplify_chains_rdp` — Ramer-Douglas-Peucker por TRAMO completo
+     (bifurcación a bifurcación/hoja/raíz), no ángulo nodo a nodo: el
+     criterio de ángulo local no detectaba zigzag repartido en varios
+     nodos con ángulo individual muy por debajo del umbral.
+  7. `build_hierarchy` — jerarquía padre-hijo por BFS desde la raíz.
+
+  **Lecciones clave para Módulo 2 en adelante:**
+  - Filtro de widgets de hueso (`pose_bone.custom_shape`) del Módulo 0
+    sigue aplicando a cualquier iteración de `bpy.data.objects`.
+  - `merge_components` y `densify_long_edges` dependen de una fuente de
+    verdad fiable para "qué nodo corresponde a qué región de la malla":
+    la posición por sí sola puede confundir dos regiones cercanas pero
+    distintas (comprobado en `densify_long_edges` — un nodo cercano en
+    posición pero de un grupo de vértices distinto daba un camino
+    incorrecto). `Skeleton.mesh_map` (pertenencia real vértice→nodo) es la
+    fuente de verdad correcta, no la proximidad espacial.
+  - `by_wavefront` con `step_size>1` agrupa el detalle geodésico fino
+    ANTES de calcular los centros de anillo — ese detalle no queda
+    accesible en el resultado ya agrupado (ni `mesh_map` ni ningún otro
+    atributo de una sola llamada); hay que recalcular a menor step_size
+    si se necesita.
+  - Limitación conocida, sin resolver: `biped_unrigged` deja 1 arista
+    residual por debajo del umbral de longitud mínima (padre=78, hijo=12,
+    ~0.0042) que ni `collapse_short_edges` ni `simplify_chains_rdp`
+    eliminan — documentada explícitamente en
+    `test_no_unexpected_edges_below_minimum_length` como excepción
+    conocida (no oculta), pendiente de tratamiento específico antes de
+    generar el `Armature` de producción.
+  - Generación de `Armature` real + conversión de ejes glTF→Blender
+    (`Blender_X=gltf_X, Blender_Y=-gltf_Z, Blender_Z=gltf_Y`) validada
+    visualmente en `backend/scripts/_render_armature_debug.py` +
+    `samples/_debug/*.png` sobre los 3 modelos — sub-paso 1.4, es
+    depuración/inspección visual, no el generador de Armature de
+    producción (eso corresponde a un módulo posterior).
+
+  Verificación: `pytest backend/tests/test_skeleton.py` → 15 passed.
