@@ -48,8 +48,16 @@ def _load_and_prepare_mesh(mesh_path: str) -> trimesh.Trimesh:
     return mesh
 
 
-def _wavefront_graph(mesh: trimesh.Trimesh, step_size: int) -> nx.Graph:
-    """Ejecuta by_wavefront y devuelve el resultado como networkx.Graph."""
+def _wavefront_result(mesh: trimesh.Trimesh, step_size: int):
+    """Ejecuta by_wavefront y devuelve (grafo, mesh_map).
+
+    ``mesh_map`` es un array indexado por vértice de malla que da el id del
+    nodo del esqueleto al que quedó asignado cada vértice (mismo orden que
+    ``mesh.vertices``) — es la pertenencia real, no una aproximación por
+    posición, y es lo que permite a ``densify_long_edges`` verificar a qué
+    nodo del esqueleto fino corresponde de verdad cada nodo del grafo en
+    bruto.
+    """
     skeleton = skeletor.skeletonize.by_wavefront(
         mesh, waves=1, step_size=step_size, progress=False
     )
@@ -57,6 +65,12 @@ def _wavefront_graph(mesh: trimesh.Trimesh, step_size: int) -> nx.Graph:
     for node_id, position in enumerate(skeleton.vertices):
         graph.add_node(node_id, pos=tuple(float(c) for c in position))
     graph.add_edges_from((int(a), int(b)) for a, b in skeleton.edges)
+    return graph, skeleton.mesh_map
+
+
+def _wavefront_graph(mesh: trimesh.Trimesh, step_size: int) -> nx.Graph:
+    """Ejecuta by_wavefront y devuelve el resultado como networkx.Graph."""
+    graph, _ = _wavefront_result(mesh, step_size)
     return graph
 
 
@@ -77,6 +91,7 @@ def densify_long_edges(
     mesh_path: str,
     threshold_pct: float = 0.10,
     fine_step_size: int = 1,
+    coarse_step_size: int = _WAVEFRONT_STEP_SIZE,
 ) -> nx.Graph:
     """Sustituye aristas del grafo en bruto anormalmente largas por el
     camino real entre sus extremos, tomado de un esqueleto recalculado a
@@ -87,21 +102,39 @@ def densify_long_edges(
     en anillos más gruesos si ``step_size > 1`` — esa agrupación ocurre
     antes de calcular los centros de anillo, así que el nivel de detalle
     fino no queda accesible en el resultado ya agrupado (ni en
-    ``Skeleton.mesh_map`` ni en ningún otro atributo): hay que recalcular.
+    ``Skeleton.mesh_map`` ni en ningún otro atributo de un único cálculo):
+    hay que recalcular a menor ``step_size``.
 
     Para cada arista de ``graph`` cuya longitud supere ``threshold_pct`` de
     la diagonal del modelo, se recalcula ``by_wavefront`` sobre la misma
-    malla con ``fine_step_size`` (por defecto 1, la resolución máxima), se
-    localizan por posición (no por id — los ids no son comparables entre
-    llamadas) los nodos de ese esqueleto fino más cercanos a cada extremo
-    de la arista larga, y se sustituye la arista original por el camino
-    más corto entre ellos en el grafo fino, insertando sus nodos
-    intermedios (con ids nuevos) en ``graph``.
+    malla dos veces: con ``coarse_step_size`` (debe coincidir con el usado
+    para producir ``graph``, para que los ids de nodo sean los mismos) y
+    con ``fine_step_size`` (por defecto 1, la resolución máxima).
 
-    El esqueleto fino solo se calcula una vez (perezosamente, la primera
-    vez que hace falta) aunque haya varias aristas marcadas, ya que
-    depende únicamente de la malla y de ``fine_step_size``, no de la
-    arista en cuestión.
+    La identificación de qué nodo del esqueleto fino corresponde a cada
+    extremo de la arista larga usa ``Skeleton.mesh_map`` de ambos cálculos
+    — no solo la posición más cercana — para evitar un fallo real
+    detectado durante el desarrollo: dos nodos con centros a distancias
+    parecidas pueden pertenecer a partes distintas del árbol (p. ej. una
+    bifurcación cercana pero anatómicamente distinta), y la posición por
+    sí sola puede confundirlos. En concreto:
+
+    1. Se identifican los vértices de malla asignados a cada extremo en el
+       esqueleto ``coarse_step_size`` (misma malla, mismo ``mesh_map`` que
+       ``graph``).
+    2. Esos mismos vértices, consultados en el ``mesh_map`` del esqueleto
+       ``fine_step_size``, dan el conjunto de nodos finos que
+       *genuinamente* pertenecen a ese extremo (no una aproximación por
+       cercanía).
+    3. Dentro de ese conjunto verificado, se toma el nodo más cercano en
+       posición al extremo original como ancla del camino — así el punto
+       de partida real (que puede no coincidir con el "borde" del grupo)
+       queda representado, en vez de saltar directamente al primer punto
+       de contacto con el otro grupo.
+
+    Se sustituye la arista original por el camino más corto entre las dos
+    anclas en el grafo fino, insertando sus nodos intermedios (con ids
+    nuevos) en ``graph``.
     """
     positions = [graph.nodes[n]["pos"] for n in graph.nodes]
     xs = [p[0] for p in positions]
@@ -118,21 +151,30 @@ def densify_long_edges(
     if not long_edges:
         return graph.copy()
 
-    fine_mesh = _load_and_prepare_mesh(mesh_path)
-    fine_graph = _wavefront_graph(fine_mesh, fine_step_size)
+    mesh = _load_and_prepare_mesh(mesh_path)
+    _, coarse_mesh_map = _wavefront_result(mesh, coarse_step_size)
+    fine_graph, fine_mesh_map = _wavefront_result(mesh, fine_step_size)
     fine_positions = {n: fine_graph.nodes[n]["pos"] for n in fine_graph.nodes}
 
-    def nearest_fine_node(target_pos: tuple[float, float, float]) -> int:
-        return min(
-            fine_positions, key=lambda n: math.dist(fine_positions[n], target_pos)
-        )
+    def verified_anchor(coarse_node: int) -> int | None:
+        """Nodo fino que de verdad pertenece al grupo de vértices de
+        ``coarse_node`` (según mesh_map) y está más cerca de su posición.
+        """
+        vertex_mask = coarse_mesh_map == coarse_node
+        candidates = set(int(x) for x in fine_mesh_map[vertex_mask])
+        if not candidates:
+            return None
+        target_pos = graph.nodes[coarse_node]["pos"]
+        return min(candidates, key=lambda n: math.dist(fine_positions[n], target_pos))
 
     densified = graph.copy()
     next_id = max(graph.nodes) + 1
 
     for u, v in long_edges:
-        fine_u = nearest_fine_node(graph.nodes[u]["pos"])
-        fine_v = nearest_fine_node(graph.nodes[v]["pos"])
+        fine_u = verified_anchor(u)
+        fine_v = verified_anchor(v)
+        if fine_u is None or fine_v is None:
+            continue  # no debería pasar salvo malla/step_size inconsistentes
         if fine_u == fine_v or not nx.has_path(fine_graph, fine_u, fine_v):
             continue  # nada que insertar, o la malla fina no conecta ambos puntos
 
