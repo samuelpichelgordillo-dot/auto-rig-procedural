@@ -3,7 +3,8 @@
 1.1: esqueletización en bruto (posiblemente con varias componentes
      desconectadas).
 1.2: fusión de componentes en un único árbol + selección de raíz.
-1.3: poda de nodos redundantes (casi colineales) + jerarquía padre-hijo.
+1.3: simplificación de tramos rectos (Ramer-Douglas-Peucker por tramo,
+     entre bifurcaciones/hojas/raíz) + jerarquía padre-hijo.
 Generación del Armature de Blender y conversión de ejes glTF→Blender: 1.4,
 todavía no implementado aquí.
 """
@@ -171,57 +172,154 @@ def select_root(tree: nx.Graph) -> int:
     return best_node
 
 
-def _angle_degrees(vector_a: tuple[float, float, float], vector_b: tuple[float, float, float]) -> float | None:
-    """Ángulo en grados entre dos vectores 3D, o None si alguno es ~nulo."""
-    norm_a = math.sqrt(sum(c * c for c in vector_a))
-    norm_b = math.sqrt(sum(c * c for c in vector_b))
-    if norm_a < 1e-12 or norm_b < 1e-12:
-        return None
-    dot = sum(a * b for a, b in zip(vector_a, vector_b))
-    cos_theta = max(-1.0, min(1.0, dot / (norm_a * norm_b)))
-    return math.degrees(math.acos(cos_theta))
+def collapse_short_edges(tree: nx.Graph, root: int, threshold: float) -> nx.Graph:
+    """Colapsa cualquier arista de longitud < ``threshold``, sin importar el
+    grado de sus extremos: fusiona ambos nodos en uno y reconecta los
+    vecinos del nodo absorbido al superviviente.
 
+    A diferencia de ``prune_redundant_joints`` (que solo toca nodos de
+    grado 2 casi colineales), esto colapsa aristas cortas entre nodos de
+    cualquier grado — pensado para geometría solapada/duplicada donde el
+    esqueletizador genera dos nodos casi coincidentes en vez de una
+    bifurcación real (p. ej. dos capas de malla en la misma zona).
 
-def prune_redundant_joints(
-    tree: nx.Graph, root: int, angle_threshold_deg: float = 170.0
-) -> nx.Graph:
-    """Colapsa nodos de grado 2 casi colineales con sus dos vecinos.
+    La raíz nunca se elimina: si una arista corta toca a la raíz, el otro
+    extremo se fusiona hacia ella (conservando la posición de la raíz). En
+    cualquier otro caso el nodo superviviente es el de id menor (elección
+    arbitraria pero determinista) y conserva su propia posición sin
+    promediar con la del nodo absorbido.
 
-    Un nodo de grado 2 es "redundante" si el ángulo entre el vector hacia
-    cada uno de sus dos vecinos es mayor o igual que ``angle_threshold_deg``
-    (es decir, el camino pasa casi en línea recta por él: no aporta
-    articulación real, solo densidad de muestreo del esqueletizador). Se
-    elimina el nodo y se conecta directamente a sus dos vecinos.
-
-    No se tocan nodos de grado 1 (extremos), de grado 3+ (bifurcaciones) ni
-    la raíz — la raíz se conserva siempre aunque tenga grado 2, porque es
-    el punto de partida fijo de la jerarquía.
-
-    El proceso es iterativo: tras cada colapso, los vecinos afectados
-    quedan con una nueva arista (con una nueva geometría), así que hace
-    falta re-evaluar la colinealidad en varias pasadas para colapsar
-    cadenas largas de nodos redundantes.
+    Como la entrada es un árbol, colapsar una arista siempre produce otro
+    árbol: dos nodos de un árbol nunca comparten más de un vecino en
+    común, así que no puede aparecer ningún ciclo ni arista duplicada.
     """
-    pruned = tree.copy()
+    collapsed = tree.copy()
     changed = True
     while changed:
         changed = False
-        for node in list(pruned.nodes):
-            if node == root or pruned.degree[node] != 2:
-                continue
-            neighbor_a, neighbor_b = list(pruned.neighbors(node))
-            pos_node = pruned.nodes[node]["pos"]
-            pos_a = pruned.nodes[neighbor_a]["pos"]
-            pos_b = pruned.nodes[neighbor_b]["pos"]
-            vector_to_a = tuple(a - n for a, n in zip(pos_a, pos_node))
-            vector_to_b = tuple(b - n for b, n in zip(pos_b, pos_node))
-            angle = _angle_degrees(vector_to_a, vector_to_b)
-            if angle is not None and angle >= angle_threshold_deg:
-                pruned.remove_node(node)
-                pruned.add_edge(neighbor_a, neighbor_b)
+        for u, v in list(collapsed.edges):
+            length = math.dist(collapsed.nodes[u]["pos"], collapsed.nodes[v]["pos"])
+            if length < threshold:
+                survivor = root if root in (u, v) else min(u, v)
+                absorbed = v if survivor == u else u
+                for neighbor in list(collapsed.neighbors(absorbed)):
+                    if neighbor != survivor:
+                        collapsed.add_edge(survivor, neighbor)
+                collapsed.remove_node(absorbed)
                 changed = True
                 break  # el grafo cambió: reiniciar el escaneo
-    return pruned
+    return collapsed
+
+
+def _point_to_line_distance(
+    point: tuple[float, float, float],
+    line_start: tuple[float, float, float],
+    line_end: tuple[float, float, float],
+) -> float:
+    """Distancia perpendicular de ``point`` a la recta (infinita) que pasa
+    por ``line_start`` y ``line_end``. Si el tramo tiene longitud ~0 (los
+    dos extremos coinciden), se usa la distancia directa a ``line_start``.
+    """
+    chord = tuple(e - s for e, s in zip(line_end, line_start))
+    chord_len_sq = sum(c * c for c in chord)
+    if chord_len_sq < 1e-24:
+        return math.dist(point, line_start)
+
+    to_point = tuple(p - s for p, s in zip(point, line_start))
+    t = sum(a * b for a, b in zip(to_point, chord)) / chord_len_sq
+    projection = tuple(s + t * c for s, c in zip(line_start, chord))
+    return math.dist(point, projection)
+
+
+def _rdp_keep_mask(
+    positions: list[tuple[float, float, float]], tolerance: float
+) -> list[bool]:
+    """Algoritmo Ramer-Douglas-Peucker sobre una polilínea 3D.
+
+    Devuelve, para cada punto de ``positions``, si sobrevive a la
+    simplificación. Los dos extremos siempre sobreviven.
+    """
+    n = len(positions)
+    keep = [False] * n
+    if n == 0:
+        return keep
+    keep[0] = True
+    keep[-1] = True
+    if n <= 2:
+        return keep
+
+    def recurse(start: int, end: int) -> None:
+        if end <= start + 1:
+            return
+        max_dist = -1.0
+        max_index = -1
+        for i in range(start + 1, end):
+            d = _point_to_line_distance(positions[i], positions[start], positions[end])
+            if d > max_dist:
+                max_dist = d
+                max_index = i
+        if max_dist > tolerance:
+            keep[max_index] = True
+            recurse(start, max_index)
+            recurse(max_index, end)
+
+    recurse(0, n - 1)
+    return keep
+
+
+def simplify_chains_rdp(tree: nx.Graph, root: int, tolerance: float) -> nx.Graph:
+    """Simplifica los tramos rectos del árbol con Ramer-Douglas-Peucker.
+
+    Sustituye el criterio anterior (evaluar el ángulo nodo a nodo en cada
+    nodo de grado 2) por uno que opera sobre el TRAMO completo entre dos
+    "puntos de anclaje": bifurcaciones (grado 3+), hojas (grado 1) o la
+    raíz. Dentro de cada tramo, RDP conserva los puntos que se desvían más
+    de ``tolerance`` (distancia perpendicular a la cuerda extremo-a-extremo
+    del tramo) y descarta el resto — a diferencia del criterio por ángulo,
+    esto detecta curvas suaves repartidas en varios nodos (donde cada
+    ángulo individual puede estar muy por debajo de cualquier umbral
+    razonable, pero el tramo en conjunto sigue siendo casi recto).
+
+    No se tocan nunca los puntos de anclaje (bifurcaciones, hojas, raíz):
+    solo se descartan nodos intermedios de grado 2 dentro de un tramo.
+    """
+
+    def is_anchor(node: int) -> bool:
+        return node == root or tree.degree[node] != 2
+
+    simplified = nx.Graph()
+    simplified.add_nodes_from((n, dict(tree.nodes[n])) for n in tree.nodes if is_anchor(n))
+
+    visited = {root}
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for neighbor in tree.neighbors(current):
+            if neighbor in visited:
+                continue
+
+            # Recorrer el tramo desde `current` hasta el siguiente anclaje.
+            chain = [current, neighbor]
+            visited.add(neighbor)
+            previous, node = current, neighbor
+            while not is_anchor(node):
+                next_node = next(n for n in tree.neighbors(node) if n != previous)
+                chain.append(next_node)
+                visited.add(next_node)
+                previous, node = node, next_node
+            stack.append(node)
+
+            positions = [tree.nodes[n]["pos"] for n in chain]
+            keep_mask = _rdp_keep_mask(positions, tolerance)
+            kept_nodes = [n for n, keep in zip(chain, keep_mask) if keep]
+
+            for kept_node in kept_nodes:
+                if kept_node not in simplified:
+                    simplified.add_node(kept_node, **tree.nodes[kept_node])
+            for a, b in zip(kept_nodes, kept_nodes[1:]):
+                simplified.add_edge(a, b)
+
+    return simplified
 
 
 def build_hierarchy(tree: nx.Graph, root: int) -> dict[int, int | None]:
