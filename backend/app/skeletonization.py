@@ -23,13 +23,14 @@ import trimesh
 # by_vertex_clusters), es adimensional y da una reducción de nodos
 # comparable en mallas de escalas muy distintas (probado sobre los 3
 # samples: cow ~9 unidades, biped ~1.8, bat ~3 — sin ajuste por modelo).
-# Antes en 2: con ese valor, el tronco/columna de cow_unrigged quedaba muy
-# sub-muestreado frente a las patas (3 nodos de raíz a cadera vs. 2 por
-# pata) y producía una arista de 4.41 que atravesaba todo el tronco de un
-# salto. Con step_size=1 esa arista más larga baja a 3.38 (con un nodo
-# intermedio nuevo) y el nº de nodos en bruto de cow_unrigged pasa de 22 a
-# 48 (ver diagnóstico correspondiente antes de este cambio).
-_WAVEFRONT_STEP_SIZE = 1
+# step_size=1 se probó como posible arreglo a una arista larga y diagonal
+# en el tronco de cow_unrigged (raíz->cadera, 4.41 de longitud), pero solo
+# la redujo a 3.38 sin resolver el problema de fondo, y aumentó bastante
+# el ruido/profundidad en biped y bat (que con step_size=2 funcionaban
+# bien). Revertido a 2. Investigar en su lugar si se puede densificar
+# selectivamente solo donde hace falta (ver notas de investigación sobre
+# skeletor.pre.contract / mesh_map en el histórico de commits).
+_WAVEFRONT_STEP_SIZE = 2
 
 
 def extract_skeleton_graph(mesh_path: str) -> nx.Graph:
