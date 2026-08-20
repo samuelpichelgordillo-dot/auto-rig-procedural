@@ -42,10 +42,9 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 2 — Skinning (en curso)
-- **Estado:** Módulo 1 completado y verificado. Módulo 2: Armature real +
-  auto-weight en bruto hechos; falta post-proceso de pesos + test de
-  deformación antes de poder cerrarlo.
+- **Módulo actual:** 3 — Animación procedural básica (siguiente, no
+  iniciado)
+- **Estado:** Módulos 0, 1 y 2 completados y verificados.
 
 ## Roadmap por módulos
 
@@ -398,3 +397,137 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   visual idéntico al ya generado (tamaños de PNG iguales o casi iguales;
   biped_unrigged difiere en <100 bytes por variación normal de encoding
   PNG entre ejecuciones, no en contenido — comparado visualmente).
+
+- **[Módulo 2 — cierre formal] 2026-08-20** — Métrica cuantitativa de
+  suavidad de pesos + test de deformación, en Python puro (numpy +
+  pygltflib) directamente sobre los GLB ya exportados en
+  `samples/_debug/{cow,biped,bat}_rigged.glb`, sin Blender.
+
+  **`backend/app/skinning_quality.py`** (nuevo, reutilizable):
+  - `read_skin_data(glb_path)`: decodifica accessors de glTF a mano
+    (componentType/type genérico, con y sin `byteStride`; matrices MAT4
+    interpretadas column-major — glTF las serializa así, hay que
+    transponer tras el reshape) — sin depender de ningún helper de
+    decodificación de pygltflib 1.16 (no trae ninguno). Soporta varios
+    nodos-malla compartiendo un mismo `skin` (caso real de biped: 3 nodos
+    Eyebrows/Eyes/SuperHero_Male con `skin=0`; bat: 2 nodos) y calcula la
+    matriz global de bind pose de cada nodo-joint recorriendo la
+    jerarquía completa desde la raíz de la escena.
+  - `weight_smoothness_metric(skin_data)`: distancia L1 entre vectores de
+    peso completos (dispersos sobre TODOS los joints del skin, no solo
+    los 4 slots de `WEIGHTS_0`) de cada arista de la triangulación.
+    Devuelve la distribución completa, no un resumen.
+  - `apply_bone_rotation(skin_data, joint_name, quat)`: linear blend
+    skinning completo — rota el hueso objetivo componiendo la rotación
+    extra CON su rotación de bind pose existente (no la sustituye), y
+    recalcula la matriz global de TODOS los joints recorriendo la
+    jerarquía de nuevo, así que los huesos descendientes heredan la
+    rotación del padre correctamente. Incluye la fórmula completa
+    `invMeshGlobal · jointGlobal · inverseBindMatrix` (no solo
+    `jointGlobal · inverseBindMatrix`) para ser correcto también si el
+    nodo-malla tuviera una transformación propia no identidad (no es el
+    caso en estos 3 samples, pero no había que asumirlo).
+  - `verify_identity_rotation_reproduces_bind_pose(skin_data)`: el
+    auto-chequeo pedido, expuesto como función reutilizable (no solo un
+    script de un solo uso) — rotación de cuaternión identidad sobre
+    cualquier hueso debe reproducir el bind pose exacto, porque
+    `jointGlobal_bind · inverseBindMatrix` es la identidad por
+    definición para cada joint. Error máximo real medido sobre los 3
+    modelos: cow 1.83e-6, biped 1.02e-6, bat 6.32e-7 — muy por debajo de
+    la tolerancia pedida de 1e-5. Es exactamente el tipo de bug que este
+    chequeo está pensado para atrapar de forma silenciosa: glTF serializa
+    MAT4 column-major, así que decodificar `inverseBindMatrices` con un
+    `reshape` sin transponer produce matrices geométricamente incorrectas
+    sin ningún error de Python — el auto-chequeo lo habría hecho evidente
+    de inmediato (identidad NO reproduciría el bind pose) en vez de dejar
+    pasar deformaciones sutilmente mal calculadas en `apply_bone_rotation`.
+
+  **`backend/tests/test_skinning.py`** (6 tests, todos en verde):
+
+  1. `test_identity_rotation_reproduces_bind_pose` — el auto-chequeo
+     anterior, como test.
+  2. `test_bind_pose_weights_sum_to_one` — regresión: suma de
+     `WEIGHTS_0` por vértice ≈ 1.0 en los 3 modelos (ya se sabía por
+     inspección manual del checkpoint del 2026-08-19; ahora automatizado).
+  3. `test_weight_smoothness_baseline` — línea base de suavizado medida
+     hoy sobre los 3 modelos (arista = par de vértices adyacentes en la
+     triangulación; distancia L1 entre sus vectores de peso completos,
+     rango [0,2]):
+
+     | modelo | aristas | mean | median | p95 | p99 | max |
+     |---|---|---|---|---|---|---|
+     | cow | 1629 | 0.4076 | 0.1807 | 1.6116 | 1.9802 | 2.0000 |
+     | biped | 22725 | 0.3753 | 0.2688 | 1.1566 | 1.6271 | 2.0000 |
+     | bat | 2403 | 0.4984 | 0.2867 | 1.6533 | 1.9235 | 2.0000 |
+
+     Los 3 modelos llegan a max=2.0 (vectores de peso completamente
+     disjuntos en al menos una arista) — esto NO es indicio de mal
+     suavizado: son bordes legítimos entre huesos rígidos lejanos en la
+     malla (p.ej. entre dos falanges consecutivas sin necesidad de
+     mezcla, lejos de cualquier articulación flexible), coherente con la
+     inspección visual de heatmaps del checkpoint anterior, que mostraba
+     transiciones suaves específicamente EN las articulaciones
+     inspeccionadas (que es lo que importa para deformación), no una
+     ausencia total de bordes duros en toda la malla.
+
+     Umbral de regresión fijado: `p99_hoy + 0.05` por modelo (margen
+     absoluto de 0.05 sobre un rango de métrica de 2.0, es decir ~2.5%
+     del rango total). Justificación: el auto-weight de Blender es
+     determinista para una malla+esqueleto fijos, así que el p99 debería
+     ser reproducible casi bit a bit entre ejecuciones; un margen de 0.05
+     absorbe ruido de punto flotante entre versiones de Blender sin dejar
+     pasar una regresión real de suavizado. Limitación conocida y
+     documentada en el propio test: como cow (1.9802) y bat (1.9235) ya
+     tienen p99 muy cerca del máximo teórico (2.0), este chequeo concreto
+     tiene poco margen de maniobra para detectar una regresión ADICIONAL
+     en esos dos modelos específicamente — la red de seguridad es más
+     sensible en biped (1.6271, con más margen hasta el máximo).
+
+  4. `test_bone_rotation_deformation_sanity` (parametrizado por modelo) —
+     para cada modelo, una muestra de 3-5 huesos (criterio reutilizado
+     del checkpoint de reselección de heatmaps: grado 2 real a ~50% de
+     distancia geométrica acumulada entre bifurcaciones reales; más un
+     hueso justo tras la raíz; más un hueso hoja; más, si existe, un
+     hueso justo antes de una bifurcación real hacia varias hojas en 1
+     salto — firma de dedos/dedos del pie):
+
+     - cow: `bone_2_3` (tras raíz), `bone_3_29` (mid-chain, el mismo del
+       heatmap de codo/rodilla), `bone_29_15` (hoja/pie). Sin ejemplo de
+       "pre-bifurcación de dedos": el esqueleto simplificado de cow no
+       tiene ninguna bifurcación real hacia varias hojas en 1 salto (los
+       únicos nodos de grado≥3 son 2,3,4,12, ninguno con ese patrón —
+       confirmado en el checkpoint de reselección de huesos), así que esa
+       categoría no aplica y se deja fuera deliberadamente.
+     - biped: `bone_48_4` (tras raíz), `bone_107_206` (mid-chain codo),
+       `bone_71_118` (mid-chain rodilla), `bone_116_30` (justo antes del
+       nodo 30, grado 5, bifurcación real hacia los dedos del pie),
+       `bone_30_3` (hoja/dedo del pie).
+     - bat: `bone_13_18` (tras raíz), `bone_34_24` (mid-chain, el mismo
+       del heatmap del ala), `bone_16_2` (justo antes del nodo 2, grado
+       3, bifurcación real hacia 2 hojas en 1 salto), `bone_24_27`
+       (hoja/punta del ala).
+
+     Para cada hueso: rotación de flexión de 35° (dentro del rango 30-45°
+     pedido) sobre el eje X local. Elección del eje: cada hueso de este
+     armature tiene a su hijo desplazado a lo largo del eje Y local
+     (`translation` del nodo-hijo ≈ `(0, longitud, 0)`, comprobado
+     directamente en el GLB) — rotar sobre X flexiona el hueso en un
+     plano perpendicular a su propio eje longitudinal (como una bisagra
+     de codo/rodilla), sin introducir torsión sobre el eje del propio
+     hueso (que sería rotar sobre Y). X es una elección arbitraria entre
+     X/Z igualmente válida para el propósito de este test — no se busca
+     verificar una pose anatómica concreta, solo ausencia de
+     NaN/Inf/explosión numérica/huérfanos tras una deformación real.
+     Verifica: sin NaN/Inf, bounding box deformado ≤3x la diagonal
+     original, y (regresión) suma de pesos ≈1.0 en bind pose.
+
+  **Verificación:** `pytest backend/tests/` completo → **26 passed**, 0
+  failed (20 del Módulo 1 + 6 nuevos del Módulo 2).
+
+  Módulo 2 cerrado formalmente: Armature real, auto-weight por difusión
+  de calor, inspección visual (segmentación + heatmaps) y ahora métrica
+  cuantitativa + test de deformación, todos verificados sobre los 3
+  samples. Sin post-proceso de pesos (suavizado manual) — decisión
+  tomada y documentada en el checkpoint de inspección visual del
+  2026-08-20: no hacía falta a nivel visual, y la línea base cuantitativa
+  de hoy no contradice esa lectura.
