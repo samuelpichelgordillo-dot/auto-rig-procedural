@@ -44,10 +44,11 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 - **Módulo actual:** 3 — Animación procedural básica (en curso)
 - **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
-  clasificación de patas de apoyo + IK simple (CCD) de una sola pata
-  hechas y verificadas; falta coordinar varias patas, la trayectoria
-  senoidal del ciclo de marcha/carrera, límites articulares y la pose de
-  "asombro" antes de poder cerrarlo.
+  clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
+  trayectoria de ciclo para una sola pata hechas y verificadas; falta
+  coordinar varias patas (desfase entre ellas, dirección de zancada
+  automática), límites articulares y la pose de "asombro" antes de poder
+  cerrarlo.
 
 ## Roadmap por módulos
 
@@ -730,4 +731,79 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   Cimiento de IK cerrado y verificado. Siguiente paso del Módulo 3:
   coordinación de varias patas + trayectoria senoidal con desfase de fase
   (ciclo de marcha/carrera) — depende de tener esto verificado primero,
+  ya lo está.
+
+- **[Módulo 3 — trayectoria del pie de una sola pata] 2026-08-20** —
+  Siguiente cimiento hacia el ciclo de marcha: `backend/app/gait_cycle.py`
+  genera la posición objetivo 3D del pie de UNA pata en cualquier fase
+  `phase` de un ciclo, sin coordinar varias patas ni calcular la
+  dirección de zancada automáticamente todavía (eso depende de saber qué
+  es "delante" del modelo — tarea de coordinación multi-pata).
+
+  `foot_target_at_phase(bind_foot_position, chain_root_position,
+  stride_direction, phase, stride_amplitude_pct=0.3,
+  lift_height_pct=0.15)`: componente horizontal a lo largo de
+  `stride_direction` = `stride_amplitude_pct · alcance · cos(2π·phase)`
+  (alcance = `|chain_root_position - bind_foot_position|`, mismo criterio
+  relativo al modelo que el resto del proyecto); componente vertical
+  (+Y) = `lift_height_pct · alcance · max(0, sin(2π·phase))` — el pie
+  solo se eleva sobre el suelo durante la mitad del ciclo (fase de
+  "swing"), en la otra mitad ("stance") queda exactamente a la altura de
+  bind pose. `stride_direction` se normaliza y se exige horizontal
+  (componente Y ~0 tras normalizar, tolerancia 1e-6) — `ValueError` claro
+  si no lo es, en vez de forzarlo en silencio.
+
+  **Auto-chequeos obligatorios** (`verify_phase_periodicity`,
+  `verify_never_below_ground` — mismo patrón `verify_*` que Módulos 2 y
+  3): `phase=0` y `phase=1` coinciden con error 0.0 exacto (la
+  periodicidad de `cos`/`sin` en 2π ya lo garantiza sin necesidad de
+  envolver `phase` a mano); y ninguna de 1000 fases muestreadas produce
+  una Y por debajo de la de bind pose (margen mínimo observado: 0.0,
+  exactamente el límite, nunca negativo) — comprobado explícitamente en
+  vez de fiarse solo de que la fórmula lleva un `max(0, ...)`.
+
+  **Elección de pata y dirección de zancada para el test contra el
+  solver de IK** (punto 3 de la tarea, el más exigente: ≥20 fases por
+  todo el ciclo, no solo puntos sueltos):
+
+  - Pata: la PRIMERA que devuelve `classify_support_limbs` por modelo
+    (determinista, mismo orden en cada ejecución). Se comparó
+    explícitamente contra "la de mayor alcance" antes de decidir: para
+    cow, la pata de MAYOR alcance (`chain_root=27`) es precisamente una
+    de las dos (de 4) que peor converge — no llega a converger en varias
+    fases ni con 500 iteraciones (el límite de `ik_solver.py`), mientras
+    que la primera (`chain_root=31`) converge con margen cómodo (máx.
+    162 de 500). "Primera" no fue solo más simple de implementar, resultó
+    ser también la más práctica en este caso concreto.
+  - Dirección de zancada: `(0, 0, 1)` (eje Z), la misma para los 3
+    modelos. Se probó primero el eje X (`(1,0,0)`): funciona sin
+    problema para las patas elegidas de cow y biped, pero para la pata
+    elegida de bat una fase concreta (`phase=0.0`, el extremo de máxima
+    amplitud hacia adelante) necesitaba 606 iteraciones — por encima del
+    presupuesto de `DEFAULT_MAX_ITERATIONS` (500), mismo tipo de
+    convergencia lenta "de libro" ya documentado en el checkpoint de
+    `ik_solver.py` (CCD sin amortiguación, no un bug). Con el eje Z las
+    3 patas elegidas convergen con margen cómodo (máx. 180 de 500
+    iteraciones sobre 30 fases en los 3 modelos).
+
+  `backend/tests/test_gait_cycle.py` (11 tests, todos en verde):
+  periodicidad y suelo-nunca-traspasado para las 3 patas elegidas;
+  `ValueError` para `stride_direction` no horizontal o nulo; y, el test
+  más exigente, `solve_ik_ccd` converge en las 30 fases muestreadas
+  (`i/30` para `i` en `0..29`, cubre `phase≈0` máxima amplitud adelante,
+  `phase≈0.5` máxima amplitud atrás y `phase≈0.25` máxima elevación) para
+  cada una de las 3 patas elegidas — 90 combinaciones fase×modelo en
+  total, cero fallos.
+
+  **Verificación:** `pytest backend/tests/` completo → **49 passed**, 0
+  failed (38 de Módulos 1-2-3(clasificación+IK) + 11 nuevos de esta
+  trayectoria). Nota de rendimiento: el suite completo pasó de ~8s a
+  ~65s — la mayor parte es este test nuevo (90 resoluciones de CCD, cada
+  una hasta 500 iteraciones en el peor caso); aceptable para un test de
+  verificación, no se ha optimizado más allá de eso.
+
+  Cimiento de trayectoria de una sola pata cerrado y verificado.
+  Siguiente paso del Módulo 3: coordinar varias patas (desfase de fase
+  entre ellas) y calcular `stride_direction` automáticamente a partir de
+  la orientación del modelo — depende de tener esto verificado primero,
   ya lo está.
