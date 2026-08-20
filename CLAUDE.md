@@ -42,9 +42,10 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 3 — Animación procedural básica (siguiente, no
-  iniciado)
-- **Estado:** Módulos 0, 1 y 2 completados y verificados.
+- **Módulo actual:** 3 — Animación procedural básica (en curso)
+- **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
+  clasificación de patas de apoyo hecha y verificada; falta el ciclo de
+  marcha/carrera paramétrico y la IK antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -531,3 +532,90 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   tomada y documentada en el checkpoint de inspección visual del
   2026-08-20: no hacía falta a nivel visual, y la línea base cuantitativa
   de hoy no contradice esa lectura.
+
+- **[Módulo 3 — clasificación de patas de apoyo] 2026-08-20** — Antes de
+  tocar cinemática (ciclos de marcha, IK), `backend/app/limb_classification.py`
+  (nuevo módulo) clasifica qué cadenas del árbol de esqueleto (ya
+  calculado por `build_skeleton_tree`, Módulo 1) son candidatas a "pata
+  de apoyo" — necesario para saber más adelante qué huesos mover en fase
+  y qué punta debe tocar el suelo. Solo clasificación geométrica estática
+  sobre la bind pose; nada de senos/cosenos ni IK todavía.
+
+  **Criterio geométrico exacto** (`classify_support_limbs` en
+  `limb_classification.py`):
+
+  1. Una hoja del árbol es "de suelo" si su altura (coordenada Y, ejes
+     glTF — el mismo espacio en el que trabaja todo `skeletonization.py`)
+     está a ≤`DEFAULT_GROUND_THRESHOLD_PCT` (0.07) de la diagonal del
+     bounding box por encima del Y mínimo global del modelo. Umbral
+     relativo a la diagonal, mismo criterio que el resto del pipeline
+     (`densify_long_edges` usa 0.10, `collapse_short_edges` /
+     `simplify_chains_rdp` usan 0.005) — nunca una unidad absoluta nueva.
+  2. Desde cada hoja de suelo, se sube por la jerarquía padre-hijo. En
+     cada paso se comprueba si el nodo padre tiene algún OTRO hijo
+     (hermano del nodo por el que veníamos subiendo) cuyo subárbol
+     también contenga una hoja de suelo — es decir, si el padre es un
+     punto donde de verdad divergen DOS patas distintas, no solo ruido
+     de malla dentro de la propia pata — Y que el padre no esté él mismo
+     cerca del suelo (si lo está, es solo el punto donde el propio pie se
+     subdivide en dedos, no una bifurcación real de cadera/hombro). El
+     `chain_root` resultante es el hijo justo por debajo de esa
+     bifurcación real (el hueso concreto de cadera/hombro de ESA pata,
+     no el nodo de cadera compartido por las dos) — el pivote que
+     necesitará el futuro ciclo de marcha. Al llegar a la raíz del
+     esqueleto sin encontrar una bifurcación así, la raíz se trata como
+     tope de todas formas (para no correr indefinidamente en un modelo
+     con una sola pata en todo el árbol, caso degenerado que no aparece
+     en los 3 samples).
+  3. Varias hojas de suelo con el mismo `chain_root` (dedos de un mismo
+     pie) se agrupan en una única `LimbChain`.
+
+  **Por qué excluye brazos/alas sin ningún caso especial:** en las 3
+  muestras los modelos están en T-pose (o equivalente) — manos y puntas
+  de ala quedan muy por encima del Y mínimo global (brazos de biped:
+  rel≥0.53; ala de bat: rel≥0.33), así que sus hojas nunca entran en el
+  paso 1. El criterio geométrico los deja fuera solo por altura, sin
+  mirar nombre de hueso ni posición en la jerarquía.
+
+  **Calibración del umbral (0.07, no 0.05):** el primer valor probado
+  (0.05, calibrado solo mirando la altura de las HOJAS) daba a biped 3
+  grupos en vez de 2 — un dedo del pie llegaba al tobillo por un camino
+  de árbol distinto al del resto de dedos, con un nodo intermedio a
+  rel=0.058 (justo por encima de 0.05, así que "no cerca del suelo") cuyo
+  padre común con el resto del pie (rel=0.055) se interpretaba entonces
+  como una bifurcación real de cadera en vez de una subdivisión interna
+  del propio pie. Recalibrando mirando la altura de TODOS los nodos (no
+  solo hojas) en los 3 samples: el nodo interior más alto que sigue
+  siendo genuinamente parte de la zona pie/tobillo está en rel=0.058
+  (biped), y el siguiente nodo por encima de eso — ya claramente parte de
+  la espinilla — está en rel=0.087 (con el hueso de referencia "rodilla"
+  del Módulo 2, `bone_71_118`, en rel=0.178). 0.07 separa ambos grupos
+  con margen en los 3 modelos, sin necesidad de ajuste por modelo.
+
+  **Resultado verificado sobre los 3 samples** (comparado contra lo ya
+  sabido por inspección manual en checkpoints anteriores):
+
+  | modelo | patas detectadas | chain_roots | esperado |
+  |---|---|---|---|
+  | cow | 4 | 31, 33, 27, 3 | 4 (cuadrúpedo) ✓ |
+  | biped | 2 | 5, 88 | 2 (brazos excluidos) ✓ |
+  | bat | 2 | 17, 15 | 1-2 (alas excluidas) ✓ |
+
+  `backend/tests/test_limb_classification.py` (6 tests, todos en verde):
+  nº de patas por modelo dentro del rango esperado (parametrizado);
+  `chain_root`/`foot_leaf` son nodos reales del árbol y `foot_leaf` está
+  entre `ground_leaves`; ninguna hoja de suelo se asigna a dos patas a la
+  vez; y un chequeo explícito del criterio de exclusión pedido — en
+  biped, ninguna hoja de mano/dedo (brazo) aparece dentro de
+  `ground_leaves` de ninguna pata (rel<0.1 exigido; `chain_root` en
+  cambio SÍ se espera a media altura — es la cadera/hombro, no se
+  comprueba su altura).
+
+  **Verificación:** `pytest backend/tests/` completo → **32 passed**, 0
+  failed (26 de Módulos 1-2 + 6 nuevos de esta clasificación).
+
+  Módulo 3 en curso: clasificación de patas cerrada y verificada. Sigue
+  pendiente el ciclo de marcha/carrera paramétrico (senoidales con
+  desfase de fase por extremidad), IK simple (CCD/FABRIK) para contacto
+  con el suelo, y la pose de "asombro" — todo eso depende de tener esto
+  verificado primero, ya lo está.
