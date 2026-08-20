@@ -259,6 +259,111 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   se quedó con su propia construcción de edit bones inline, duplicada. Ver
   el checkpoint siguiente para el fix real.
 
+- **[Módulo 2 — inspección visual de pesos] 2026-08-20** —
+  `backend/scripts/_render_weights_debug.py` (debug, prefijo `_`): lee un
+  GLB ya rigged de `samples/_debug/{cow,biped,bat}_rigged.glb` (sin
+  recalcular nada, mismo patrón que `_render_rigged_debug.py`) y genera:
+  (a) segmentación por hueso dominante — cada vértice coloreado según el
+  vertex group de mayor peso, paleta categórica fija de 20 colores
+  (aprox. 'tab20'), asignada por orden alfabético de nombre de hueso para
+  ser determinista sin añadir matplotlib como dependencia; y (b) mapa de
+  calor (azul=0, rojo=1) de 1-2 huesos elegidos a mano por modelo,
+  inspeccionando la jerarquía del esqueleto exportada con
+  `_export_skeleton_json.py` (posiciones ya en ejes Blender): cow →
+  `bone_3_29` (codo/rodilla de la pata delantera), biped → `bone_57_107`
+  (codo) y `bone_5_71` (rodilla), bat → `bone_33_34` (articulación media
+  del ala). Cada heatmap incluye un marcador cian en el punto medio del
+  hueso resaltado. Vista frontal + lateral, mismo encuadre que los scripts
+  anteriores.
+
+  Generados en `samples/_debug/`: 3× `{modelo}_weights_segmentation_
+  {front,side}.png` y 4× `{modelo}_weights_heatmap_{etiqueta}_
+  {front,side}.png` (14 renders en total).
+
+  **Lectura de los resultados (solo inspección visual, sin decisión de
+  post-proceso todavía):** la segmentación muestra regiones por hueso
+  razonablemente compactas y sin salpicado disperso en los 3 modelos — no
+  hay indicios de vértices con influencia dominante de un hueso lejano
+  (síntoma típico de auto-weight sin post-procesar). Los heatmaps de codo/
+  rodilla/articulación de ala muestran una transición roja→azul suave
+  centrada en la articulación marcada, sin franjas duras ni vértices
+  aislados en rojo puro rodeados de azul puro (lo que indicaría ruido de
+  alta frecuencia necesitando suavizado). Conclusión preliminar: los pesos
+  en bruto parecen razonables a nivel visual; queda pendiente el test de
+  deformación cuantitativo (mover un hueso y medir distancia post-
+  deformación) para confirmar si el post-proceso de pesos sigue siendo
+  necesario o es opcional en estos 3 samples — decisión para la siguiente
+  sesión.
+
+  Nota técnica: `blender --background` con una ruta de salida relativa
+  (`samples/_debug`) resolvió el path de forma inconsistente en esta
+  sesión (escribió una vez en `C:\samples\_debug` en vez del repo) — se
+  usó una ruta absoluta al invocar el script para evitarlo. Aplica a
+  cualquier invocación futura de scripts de Blender headless con rutas de
+  salida relativas.
+
+- **[Módulo 2 — corrección de huesos elegidos para heatmaps] 2026-08-20**
+  — Verificación estructural independiente (grado de cada nodo del árbol
+  de esqueleto + detección de ramas espurias de 1 salto a hoja aislada,
+  usando solo `build_skeleton_tree`, sin Blender) mostró que 3 de los 4
+  huesos elegidos en el checkpoint anterior para (b) no eran el punto
+  medio de una articulación real:
+
+  - biped `bone_57_107` ("codo"): el nodo 107 es él mismo una bifurcación
+    espuria (rama de 1 salto a la hoja aislada 147) — firma de dedo/bulto
+    de malla, no de articulación.
+  - biped `bone_5_71` ("rodilla"): el nodo 71 es grado 4, con DOS ramas
+    espurias de 1 salto (130, 132) — firma de dedo del pie.
+  - bat `bone_33_34`: la cadena completa del ala (excluyendo el tramo
+    torso->hombro 13->18, que es sobre todo attachment, no ala) es
+    18->33->34->24->27; el nodo 33 está solo al 13% de la distancia
+    acumulada 18->27, muy lejos del punto medio real.
+
+  Criterio revisado y aplicado para la reselección: el nodo debe ser
+  **grado 2** (paso simple, sin bifurcación propia) y estar lo más cerca
+  posible del **50% de la distancia geométrica acumulada** (no del nº de
+  saltos, que es engañoso cuando la densidad de nodos no es uniforme a lo
+  largo de la cadena — comprobado explícitamente en biped, donde la zona
+  cercana a la mano está mucho más densificada que la zona cercana al
+  hombro) entre dos bifurcaciones reales (nodos de grado ≥3 que no
+  terminan en una hoja aislada a 1-2 saltos).
+
+  Nuevos huesos: biped codo → `bone_107_206` (nodo 206, grado 2, al 74%
+  de hombro(180)->mano(151); único candidato limpio más cercano al medio,
+  ya que 106 —el otro nodo grado 2— está solo al 17%). Biped rodilla →
+  `bone_71_118` (nodo 118, grado 2, al 47.5% de cadera(72)->tobillo(30) —
+  el más cercano al punto medio real de toda la cadena). Bat ala →
+  `bone_34_24` (nodo 24, al 45% de la parte real del ala 18->27, tras
+  excluir el tramo torso->hombro). Se comprobó también si el murciélago
+  tenía una segunda cadena de ala más representativa (bajo el nodo 16,
+  grado 5) — sus subcadenas más largas tienen 2-3 saltos hasta hoja,
+  consistentes con orejas/nariz, no con un ala; se confirmó que
+  18->33->34->24->27 es la única cadena de extremidad larga en el modelo.
+  `cow bone_3_29` se verificó y se confirmó correcto sin cambios (único
+  nodo interior de grado 2 de esa pata, al 66.5% de la cadena).
+
+  Heatmaps regenerados para los 3 modelos (`samples/_debug/{modelo}_
+  weights_heatmap_*`); la segmentación por hueso dominante no depende de
+  esta corrección y se dejó sin recalcular en contenido (se regeneró junto
+  al resto por conveniencia del comando, pero es bit-a-bit equivalente).
+
+  **Verificación adicional de la paleta categórica en biped** (182
+  huesos, 20 colores): con asignación de color por orden alfabético del
+  nombre de hueso, hay colisión de color entre huesos ADYACENTES
+  (padre-hijo en la jerarquía) en 7 de 177 pares comprobados (~4%) —
+  ejemplo: `bone_4_115` y `bone_115_157` comparten índice de color 10 por
+  pura coincidencia alfabética. Esto significa que, en esos 7 puntos
+  concretos de la malla de biped, un borde de "fuga" de peso real entre
+  dos huesos vecinos podría no ser visible en el render de segmentación
+  (ambos lados del borde tendrían el mismo color aunque los vertex groups
+  sean distintos) — la lectura de "regiones compactas sin salpicado" del
+  checkpoint anterior es válida en general pero no es una garantía
+  completa para esos puntos concretos. No se ha corregido (fuera de
+  alcance de esta tarea; requeriría asignar color por adyacencia en el
+  árbol en vez de por orden alfabético, o una paleta más grande). Pendiente
+  para si se decide confiar más en la segmentación por hueso dominante en
+  el futuro.
+
   **Bug real encontrado y corregido durante el desarrollo:** con la malla
   tal como la importa Blender (vértices duplicados por cara, igual
   problema que motivó `merge_vertices` en `skeletonization.py` para el
