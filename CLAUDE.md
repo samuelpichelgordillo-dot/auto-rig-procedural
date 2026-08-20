@@ -44,8 +44,10 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 - **Módulo actual:** 3 — Animación procedural básica (en curso)
 - **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
-  clasificación de patas de apoyo hecha y verificada; falta el ciclo de
-  marcha/carrera paramétrico y la IK antes de poder cerrarlo.
+  clasificación de patas de apoyo + IK simple (CCD) de una sola pata
+  hechas y verificadas; falta coordinar varias patas, la trayectoria
+  senoidal del ciclo de marcha/carrera, límites articulares y la pose de
+  "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -619,3 +621,113 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   desfase de fase por extremidad), IK simple (CCD/FABRIK) para contacto
   con el suelo, y la pose de "asombro" — todo eso depende de tener esto
   verificado primero, ya lo está.
+
+- **[Módulo 3 — IK simple (CCD) para una sola pata] 2026-08-20** —
+  Cimiento previo al ciclo de marcha: `backend/app/ik_solver.py` resuelve
+  IK por CCD (Cyclic Coordinate Descent) para UNA pata (un `LimbChain` de
+  `limb_classification.py`), dado un objetivo 3D para su `foot_leaf`.
+  Nada de coordinación multi-pata, trayectoria senoidal ni límites
+  articulares todavía — es deliberadamente solo "puedo hacer que UN pie
+  llegue a UN punto".
+
+  **Reutiliza `skinning_quality.py` en vez de duplicar infraestructura**
+  (tal y como pedía la tarea): se renombraron dos helpers que antes eran
+  privados de ese módulo a públicos (`_global_matrices` →
+  `compute_global_matrices`, `_trs_to_matrix` → `trs_to_matrix`) y se
+  añadieron dos utilidades de cuaterniones que faltaban —
+  `quat_conjugate` (inverso de un cuaternión unitario) y
+  `matrix3_to_quat` (inversa de la conversión cuaternión→matriz ya
+  existente, algoritmo estándar por casos según la traza) — porque CCD
+  necesita, en cada sub-paso, la rotación global ACTUAL del padre de un
+  hueso (no solo la de bind pose) para convertir una rotación calculada
+  en espacio mundo a una actualización de la rotación LOCAL del hueso.
+
+  **Por qué `apply_bone_rotation` (Módulo 2) no bastaba tal cual:** rota
+  un solo hueso de una sola vez y devuelve posiciones de vértices de
+  malla — CCD necesita, en cada sub-paso, (a) rotar un hueso DADO el
+  estado ya acumulado de rotaciones de los huesos anteriores de la misma
+  pasada, y (b) saber "dónde está el pie ahora", que no es un vértice de
+  malla sino un punto virtual en la punta de la cadena de huesos.
+
+  **El problema de "dónde está el pie" y su solución** (`tip_bone_and_offset`
+  / `foot_position_given_rotations` en `ik_solver.py`): el último hueso
+  de una cadena de pata es una hoja del árbol de esqueleto — no tiene
+  ningún hijo en el glTF que codifique su propia longitud (a diferencia
+  de un hueso intermedio, cuya longitud ES la traslación de su hijo). Se
+  resuelve derivando, UNA SOLA VEZ en bind pose, el offset local fijo
+  dentro del marco de ese hueso que representa la posición real del pie
+  (usando `tree.nodes[foot_leaf]["pos"]` del árbol de esqueleto —
+  Módulo 1 — como fuente de verdad de esa posición, ya que el propio
+  build_armature.py generó el Armature a partir de esas mismas
+  coordenadas); en cualquier pose posterior, la posición del pie es ese
+  offset transformado por la matriz global ACTUAL del último hueso.
+
+  **Algoritmo** (`solve_ik_ccd`, `chain_bone_names` da la cadena de
+  huesos de pie a raíz — incluye el hueso que TERMINA en `chain_root`,
+  el hueso concreto de cadera/hombro de esta pata): por cada hueso de la
+  cadena, de pie a raíz, en cada pasada: (1) recalcula las matrices
+  globales de todo el esqueleto con el estado actual; (2) el pivote de
+  este hueso es la traslación de su propia matriz global (== posición
+  mundo de la CABEZA de ese hueso, ver docstring — la traslación de la
+  matriz global de un hueso "bone_P_C" da la posición del nodo P, no C,
+  porque el origen local de un hueso ES su propia cabeza); (3) calcula la
+  rotación en espacio mundo que llevaría pivote→pie sobre pivote→objetivo
+  (eje = producto vectorial normalizado, ángulo = arco-coseno del
+  producto escalar; se salta el hueso esta pasada si los vectores ya
+  están alineados o son casi antiparalelos — eje indefinido, no aparece
+  con los objetivos alcanzables usados en los tests); (4) convierte esa
+  rotación de mundo a una actualización de la rotación LOCAL del hueso
+  vía composición de cuaterniones con la rotación global actual del
+  padre: `nueva_local = conj(G_padre) · R_mundo · G_padre · local_actual`.
+
+  **Auto-chequeo obligatorio** (`verify_zero_displacement_converges_immediately`,
+  igual patrón que `verify_identity_rotation_reproduces_bind_pose` del
+  Módulo 2): un objetivo que coincide EXACTAMENTE con la posición del pie
+  en bind pose debe converger SIN rotar nada (`iterations_used == 0`).
+  Verificado en las 8 patas de los 3 modelos: error 1e-17 a 5e-16, muy
+  por debajo de cualquier tolerancia razonable.
+
+  **Objetivos de test alcanzables** (`test_ik_solver.py`,
+  `_reachable_target`): en vez de inventar una posición 3D (la tarea
+  pedía explícitamente evitarlo), cada objetivo se deriva rotando el
+  hueso más próximo a `chain_root` un ángulo conocido (20°, -15° y 15°,
+  sobre los ejes X y Z) y leyendo por cinemática directa dónde queda el
+  pie — así el objetivo es, por construcción, una pose que la pata SÍ
+  puede alcanzar con exactamente una rotación. Elección de eje: mismo
+  criterio que `test_skinning.py` (`_FLEX_AXIS`) — los huesos de este
+  armature apuntan a lo largo del eje Y local, así que X/Z flexionan sin
+  torsión sobre el propio eje del hueso. Se probó primero con objetivos
+  generados por desplazamiento radial directo hacia `chain_root` (más
+  simple, pero **resultó ser irrealizable para patas de un solo hueso** —
+  bat `chain_root=15=foot_leaf`: un hueso rígido solo puede mover la
+  punta sobre una esfera de radio fijo alrededor de su cabeza, así que
+  acercar el pie en línea recta al pivote es geométricamente imposible
+  para esa pata concreta; el solver correctamente no convergía, error
+  ~0.16-0.32 tras 200 iteraciones). Los objetivos por rotación conocida
+  no tienen ese problema por construcción, para cadenas de cualquier
+  longitud (1 a 14 huesos en estos 3 samples).
+
+  **`DEFAULT_MAX_ITERATIONS = 500`:** CCD converge en pocas iteraciones
+  para la mayoría de combinaciones pata/objetivo probadas (1-43), pero
+  al menos una (cow, `chain_root=27`, flexión de -15° sobre X) necesitó
+  356 — comportamiento conocido de CCD "de libro" (sin amortiguación ni
+  límites articulares): para ciertas geometrías de cadena y direcciones
+  de objetivo converge mucho más despacio sin que eso indique un bug (el
+  error baja de forma monótona hasta el objetivo). 500 da margen sobre
+  el peor caso observado; si una futura pata necesitara más, es señal de
+  que hace falta amortiguación (damping) o una cota de ángulo por paso —
+  mejora de una fase posterior, no de este cimiento.
+
+  `backend/tests/test_ik_solver.py` (6 tests, todos en verde): el
+  auto-chequeo de arriba para las 8 patas de los 3 modelos, y
+  convergencia (`error < 1e-4`, `iterations_used <= 500`) para 3
+  objetivos alcanzables por pata (24 combinaciones pata×objetivo en
+  total).
+
+  **Verificación:** `pytest backend/tests/` completo → **38 passed**, 0
+  failed (32 de Módulos 1-2-3(clasificación) + 6 nuevos de este IK).
+
+  Cimiento de IK cerrado y verificado. Siguiente paso del Módulo 3:
+  coordinación de varias patas + trayectoria senoidal con desfase de fase
+  (ciclo de marcha/carrera) — depende de tener esto verificado primero,
+  ya lo está.

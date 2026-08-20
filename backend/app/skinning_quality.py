@@ -18,6 +18,7 @@ cualquier GLB exportado por Blender con el mismo pipeline):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -105,7 +106,49 @@ def axis_angle_to_quat(axis: np.ndarray, angle_rad: float) -> np.ndarray:
     return np.array([*(axis * np.sin(half)), np.cos(half)], dtype=np.float64)
 
 
-def _trs_to_matrix(
+def quat_conjugate(quat: np.ndarray) -> np.ndarray:
+    """Inverso de un cuaternión unitario (conjugado): invierte el sentido
+    de la rotación. Cuaterniones en orden [x,y,z,w]."""
+    x, y, z, w = quat
+    return np.array([-x, -y, -z, w], dtype=np.float64)
+
+
+def matrix3_to_quat(rotation_matrix: np.ndarray) -> np.ndarray:
+    """Convierte una matriz de rotación 3x3 a cuaternión [x,y,z,w]. Inversa
+    de `_quat_to_matrix3` — algoritmo estándar por casos según la traza
+    (Shepperd), para evitar división por un término casi nulo cuando la
+    traza es negativa."""
+    m = rotation_matrix
+    trace = m[0, 0] + m[1, 1] + m[2, 2]
+    if trace > 0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (m[2, 1] - m[1, 2]) * s
+        y = (m[0, 2] - m[2, 0]) * s
+        z = (m[1, 0] - m[0, 1]) * s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = 2.0 * math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([x, y, z, w], dtype=np.float64)
+    return quat / np.linalg.norm(quat)
+
+
+def trs_to_matrix(
     translation: np.ndarray, rotation_quat: np.ndarray, scale: np.ndarray
 ) -> np.ndarray:
     matrix = np.eye(4, dtype=np.float64)
@@ -126,7 +169,7 @@ class NodeTRS:
     scale: np.ndarray
 
     def to_matrix(self) -> np.ndarray:
-        return _trs_to_matrix(self.translation, self.rotation, self.scale)
+        return trs_to_matrix(self.translation, self.rotation, self.scale)
 
 
 def _node_trs(node: pygltflib.Node) -> NodeTRS:
@@ -175,7 +218,7 @@ class SkinData:
     mesh_node_global_bind: dict[int, np.ndarray] = field(default_factory=dict)
 
 
-def _global_matrices(
+def compute_global_matrices(
     root_node_index: int,
     node_children: dict[int, list[int]],
     local_matrix_of: dict[int, np.ndarray],
@@ -221,7 +264,7 @@ def read_skin_data(glb_path: str) -> SkinData:
     root_node_index = scene.nodes[0]
 
     local_matrix_of = {i: trs.to_matrix() for i, trs in node_trs.items()}
-    bind_globals = _global_matrices(root_node_index, node_children, local_matrix_of)
+    bind_globals = compute_global_matrices(root_node_index, node_children, local_matrix_of)
 
     inverse_bind_matrices = _read_accessor(gltf, blob, skin.inverseBindMatrices)
 
@@ -331,13 +374,13 @@ def apply_bone_rotation(
     for node_index, trs in skin_data.node_trs.items():
         if node_index == target_node:
             new_rotation = quat_multiply(trs.rotation, rotation_quaternion)
-            local_matrix_of[node_index] = _trs_to_matrix(
+            local_matrix_of[node_index] = trs_to_matrix(
                 trs.translation, new_rotation, trs.scale
             )
         else:
             local_matrix_of[node_index] = trs.to_matrix()
 
-    globals_ = _global_matrices(
+    globals_ = compute_global_matrices(
         skin_data.root_node_index, skin_data.node_children, local_matrix_of
     )
 
