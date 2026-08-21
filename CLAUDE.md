@@ -46,10 +46,10 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 - **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
   clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
   trayectoria de ciclo para una sola pata + dirección de zancada
-  automática + reparto de fase entre patas hechas y verificadas; falta
-  conectar el patrón de fases a un bucle real de varias patas con IK,
-  resolver el signo de `stride_direction`, límites articulares y la pose
-  de "asombro" antes de poder cerrarlo.
+  automática + reparto de fase entre patas + pose de marcha con varias
+  patas a la vez hechas y verificadas; falta resolver el signo de
+  `stride_direction`, límites articulares y la pose de "asombro" antes
+  de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -1162,3 +1162,82 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   del Módulo 3: conectar este patrón de fases a un bucle real de varias
   patas moviéndose a la vez con `solve_ik_ccd`, resolución del signo de
   `stride_direction`, límites articulares y la pose de "asombro".
+
+- **[Módulo 3 — pose de marcha completa, varias patas a la vez]
+  2026-08-21** — `solve_gait_cycle_pose` en `gait_cycle.py`: dado un
+  `global_phase` único, calcula la pose de TODAS las patas de un modelo
+  a la vez, cada una en su propia fase local (`global_phase +
+  phase_offsets[chain_root]`), resuelta con `solve_ik_ccd` y combinada
+  en un único dict de rotaciones para todo el esqueleto. Nada de límites
+  articulares ni pose de "asombro" todavía.
+
+  **Paso previo separado, `compute_safe_amplitudes(limbs, tree,
+  hierarchy, stride_direction)`**: `max_chain_bone_length` +
+  `safe_stride_amplitude_pct` para cada pata, UNA VEZ (no por fase) —
+  mismo criterio de separación de responsabilidades que ya defendía el
+  docstring del módulo para `safe_stride_amplitude_pct` en sí (paso
+  explícito previo al bucle de fases, nunca un recorte implícito
+  repetido en cada llamada).
+
+  **Independencia entre patas, verificada, no solo asumida**: las patas
+  son cadenas de huesos disjuntas (`classify_support_limbs` garantiza
+  implícitamente que ningún hueso pertenece a dos `LimbChain` distintas
+  — cada una es una rama separada del árbol de esqueleto), así que
+  resolverlas una a una con `solve_ik_ccd` y combinar los
+  `local_rotations` al final es válido; no hace falta un solver
+  conjunto. Cada `IKResult.local_rotations` ya trae la rotación de bind
+  pose para los huesos FUERA de su propia cadena, así que combinar es
+  simplemente: empezar el dict en bind pose completo, y para cada pata
+  sobrescribir solo las entradas de sus propios huesos
+  (`chain_bone_names` + `name_to_node_index`). Se comprobó
+  explícitamente (no solo se asumió) que resolver varias patas a la vez
+  no necesita más iteraciones que resolverlas por separado — en las 3×24
+  combinaciones modelo×fase probadas, cero fallos y ninguna pata excedió
+  su presupuesto de iteraciones ya conocido.
+
+  **Verificación visual** (`backend/scripts/_plot_gait_cycle_debug.py`,
+  nuevo, matplotlib sin Blender, mismo patrón de estilo que los scripts
+  anteriores): un subplot por pata, altura (Y) del pie resuelto frente a
+  `global_phase` en 40 puntos. Comprobado a ojo sobre los 3 modelos
+  (`samples/_debug/{modelo}_gait_cycle_heights.png`):
+
+  - cow: las curvas de `chain_root=31` y `chain_root=27` (mismo grupo
+    diagonal, `phase_offset=0.0`) son PRÁCTICAMENTE IDÉNTICAS entre sí
+    (pico en `phase≈0.23`), y las de `chain_root=33`/`chain_root=3`
+    (el otro par, `phase_offset=0.5`) también lo son entre ellas (pico
+    en `phase≈0.73`) — desfasadas exactamente medio periodo respecto al
+    primer par. Confirma visualmente, no solo por los números de
+    `assign_limb_phase_offsets`, que el trote diagonal funciona de
+    verdad en la trayectoria resuelta.
+  - biped: alternancia limpia entre las 2 patas, picos desfasados medio
+    periodo.
+  - bat: `chain_root=17` muestra el patrón de swing esperado;
+    `chain_root=15` sale COMPLETAMENTE PLANO — consistente con un
+    hallazgo ya documentado (checkpoint del `chain_root=15` de bat en
+    módulos anteriores: esta pata tiene `chain_root == foot_leaf`, un
+    solo hueso, `reach=0` por construcción, así que
+    `safe_stride_amplitude_pct` no tiene ninguna distancia sobre la que
+    aplicar amplitud — el pie se queda fijo en su posición de bind pose
+    durante todo el ciclo). No es un bug nuevo, es la extensión esperada
+    de algo ya sabido.
+
+  **`backend/tests/test_gait_cycle.py`** ampliado con 5 tests nuevos
+  (39 en total, antes 34): convergencia de TODAS las patas en >=20 fases
+  globales por modelo (`test_all_limbs_converge_across_full_cycle` —
+  comprobado explícitamente que combinar patas no degrada la
+  convergencia, no solo asumido por la independencia teórica);
+  preservación de huesos ajenos a cualquier pata en bind pose exacta
+  (`test_combined_rotations_preserve_non_limb_bones`, cow: columna,
+  cabeza, cola...); y confirmación de que el desfase se aplica de
+  verdad, no solo que todo converge a algún punto (`test_
+  phase_zero_offset_limbs_at_forward_extreme`, cow, `global_phase=0.0`
+  — verificado por cinemática directa sobre el dict COMBINADO, no
+  confiando solo en `IKResult.final_error` de cada pata por separado).
+
+  **Verificación:** `pytest backend/tests/` completo → **77 passed**, 0
+  failed (72 de antes + 5 nuevos).
+
+  Pose de marcha con varias patas a la vez cerrada y verificada.
+  Todavía pendiente del Módulo 3: resolución del signo de
+  `stride_direction` (qué extremo es "adelante"), límites articulares
+  anatómicos, y la pose de "asombro".

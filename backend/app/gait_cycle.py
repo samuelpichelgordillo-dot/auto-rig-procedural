@@ -35,8 +35,15 @@ import math
 import networkx as nx
 import numpy as np
 
-from backend.app.ik_solver import chain_bone_names
+from backend.app.ik_solver import (
+    DEFAULT_MAX_ITERATIONS,
+    IKResult,
+    chain_bone_names,
+    name_to_node_index,
+    solve_ik_ccd,
+)
 from backend.app.limb_classification import LimbChain
+from backend.app.skinning_quality import SkinData
 
 _STRIDE_DIRECTION_Y_TOLERANCE = 1e-6
 
@@ -513,3 +520,113 @@ def assign_limb_phase_offsets(
         f"assign_limb_phase_offsets solo cubre 2 o 4 patas (lo que aparece en "
         f"los 3 samples de este proyecto), hay {len(limbs)}"
     )
+
+
+def compute_safe_amplitudes(
+    limbs: list[LimbChain],
+    tree: nx.Graph,
+    hierarchy: dict[int, "int | None"],
+    stride_direction: np.ndarray,
+) -> dict[int, float]:
+    """`max_chain_bone_length` + `safe_stride_amplitude_pct` para cada
+    pata, UNA VEZ (no por fase) — mismo criterio de separación de
+    responsabilidades que ya explica el docstring de este módulo sobre
+    por qué `safe_stride_amplitude_pct` es un paso explícito previo, no
+    un recorte implícito dentro de `foot_target_at_phase`: aquí se hace
+    explícito también que es un cálculo POR PATA, no por fase — llamarlo
+    dentro de un bucle de fases repetiría trabajo idéntico en cada
+    iteración sin ninguna ganancia (la amplitud segura de una pata no
+    depende de la fase, solo de su propia geometría).
+
+    Devuelve `chain_root -> stride_amplitude_pct` ya seguro, listo para
+    pasar a `foot_target_at_phase` (o, como aquí, a `solve_gait_cycle_pose`)
+    en cualquier fase del ciclo sin recalcular nada más.
+    """
+    amplitudes: dict[int, float] = {}
+    for limb in limbs:
+        bind_foot_position = np.array(tree.nodes[limb.foot_leaf]["pos"], dtype=np.float64)
+        chain_root_position = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+        max_length = max_chain_bone_length(limb, hierarchy, tree)
+        amplitudes[limb.chain_root] = safe_stride_amplitude_pct(
+            bind_foot_position, chain_root_position, max_length, stride_direction
+        )
+    return amplitudes
+
+
+def solve_gait_cycle_pose(
+    skin_data: SkinData,
+    limbs: list[LimbChain],
+    tree: nx.Graph,
+    hierarchy: dict[int, "int | None"],
+    global_phase: float,
+    stride_direction: np.ndarray,
+    phase_offsets: dict[int, float],
+    amplitude_by_root: dict[int, float],
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+) -> tuple[dict[int, np.ndarray], dict[int, IKResult]]:
+    """Pose de TODAS las patas de `limbs` a la vez, en `global_phase`.
+
+    Cada pata tiene su propia fase LOCAL (`global_phase +
+    phase_offsets[chain_root]`), resuelta de forma INDEPENDIENTE con
+    `solve_ik_ccd` — válido porque las patas son cadenas de huesos
+    disjuntas (cada `chain_root` distinto no comparte ningún hueso con
+    otra pata, garantizado implícitamente por `classify_support_limbs`:
+    cada `LimbChain` es una rama separada del árbol de esqueleto), así
+    que no hace falta ningún solver conjunto — resolver cada pata por su
+    cuenta y combinar los resultados al final da exactamente el mismo
+    resultado que resolverlas "a la vez" en cualquier sentido físico
+    relevante aquí (no hay una restricción compartida entre patas, cada
+    una solo mueve sus propios huesos).
+
+    Combina los `local_rotations` de cada `ik_solver.IKResult` en un
+    ÚNICO dict para todo el esqueleto: cada `IKResult.local_rotations`
+    ya trae la rotación de BIND POSE para los huesos fuera de su propia
+    cadena (ver docstring de `IKResult`), así que para cada pata basta
+    con sobrescribir en el dict combinado solo las entradas de los
+    huesos que pertenecen a ESA cadena (`chain_bone_names` +
+    `name_to_node_index`), dejando el resto tal como esté. El dict
+    combinado empieza en bind pose (una copia de
+    `skin_data.node_trs[...].rotation` para cada nodo) antes de aplicar
+    las patas una a una — así, si `limbs` no cubre TODOS los huesos del
+    esqueleto (nunca lo hace: columna, cabeza, cola, etc. no pertenecen
+    a ninguna pata), esos huesos quedan correctamente en bind pose en el
+    resultado final.
+
+    Devuelve `(combined_local_rotations, ik_results_by_chain_root)` — el
+    segundo elemento es para que quien llame (o los tests) pueda
+    comprobar convergencia e iteraciones por pata sin tener que
+    re-derivar nada volviendo a llamar a `solve_ik_ccd`.
+    """
+    combined_local_rotations: dict[int, np.ndarray] = {
+        node_index: trs.rotation.copy() for node_index, trs in skin_data.node_trs.items()
+    }
+    ik_results_by_chain_root: dict[int, IKResult] = {}
+    name_to_index = name_to_node_index(skin_data)
+
+    for limb in limbs:
+        bind_foot_position = np.array(tree.nodes[limb.foot_leaf]["pos"], dtype=np.float64)
+        chain_root_position = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+        local_phase = global_phase + phase_offsets[limb.chain_root]
+        target = foot_target_at_phase(
+            bind_foot_position,
+            chain_root_position,
+            stride_direction,
+            local_phase,
+            stride_amplitude_pct=amplitude_by_root[limb.chain_root],
+        )
+
+        result = solve_ik_ccd(
+            skin_data,
+            limb,
+            hierarchy,
+            bind_foot_position,
+            target,
+            max_iterations=max_iterations,
+        )
+        ik_results_by_chain_root[limb.chain_root] = result
+
+        for bone_name in chain_bone_names(limb, hierarchy):
+            node_index = name_to_index[bone_name]
+            combined_local_rotations[node_index] = result.local_rotations[node_index]
+
+    return combined_local_rotations, ik_results_by_chain_root

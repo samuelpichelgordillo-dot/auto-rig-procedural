@@ -18,14 +18,23 @@ import pytest
 
 from backend.app.gait_cycle import (
     assign_limb_phase_offsets,
+    compute_safe_amplitudes,
     detect_stride_direction,
     foot_target_at_phase,
     max_chain_bone_length,
     safe_stride_amplitude_pct,
+    solve_gait_cycle_pose,
     verify_never_below_ground,
     verify_phase_periodicity,
 )
-from backend.app.ik_solver import DEFAULT_MAX_ITERATIONS, solve_ik_ccd
+from backend.app.ik_solver import (
+    DEFAULT_MAX_ITERATIONS,
+    chain_bone_names,
+    foot_position_given_rotations,
+    name_to_node_index,
+    solve_ik_ccd,
+    tip_bone_and_offset,
+)
 from backend.app.limb_classification import classify_support_limbs
 from backend.app.skeletonization import build_skeleton_tree
 from backend.app.skinning_quality import read_skin_data
@@ -395,3 +404,110 @@ def test_ik_converges_across_full_cycle(
         f"del techo esperado ({max_iterations_ceiling}) — posible regresión de "
         "rendimiento aunque todo haya convergido"
     )
+
+
+# --- solve_gait_cycle_pose (varias patas a la vez) ---
+
+_NUM_GLOBAL_PHASE_SAMPLES = 24
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_all_limbs_converge_across_full_cycle(skeleton_and_skin_by_model, model):
+    """Resolver varias patas a la vez, en vez de una por una como hace
+    `test_ik_converges_across_full_cycle`, podría en teoría necesitar
+    más iteraciones si algo se combinase mal — se comprueba
+    explícitamente, no se asume que la independencia entre patas basta
+    (documentada en `solve_gait_cycle_pose`, pero verificada aquí de
+    todas formas)."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+    offsets = assign_limb_phase_offsets(limbs, tree, direction)
+    amplitudes = compute_safe_amplitudes(limbs, tree, hierarchy, direction)
+
+    failures = []
+    for i in range(_NUM_GLOBAL_PHASE_SAMPLES):
+        global_phase = i / _NUM_GLOBAL_PHASE_SAMPLES
+        _, results = solve_gait_cycle_pose(
+            skin_data, limbs, tree, hierarchy, global_phase, direction, offsets, amplitudes
+        )
+        for chain_root, result in results.items():
+            if not result.converged:
+                failures.append((global_phase, chain_root, result.final_error, result.iterations_used))
+
+    assert not failures, f"{model}: fases/patas que no convergieron: {failures}"
+
+
+def test_combined_rotations_preserve_non_limb_bones(skeleton_and_skin_by_model):
+    """Los huesos que no pertenecen a NINGUNA pata (columna, cabeza,
+    cola...) deben quedar en su rotación de bind pose exacta en el dict
+    combinado — la combinación no debe "contaminar" huesos ajenos a las
+    patas."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model["cow"]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+    offsets = assign_limb_phase_offsets(limbs, tree, direction)
+    amplitudes = compute_safe_amplitudes(limbs, tree, hierarchy, direction)
+
+    name_to_index = name_to_node_index(skin_data)
+    limb_bone_indices = set()
+    for limb in limbs:
+        for bone_name in chain_bone_names(limb, hierarchy):
+            limb_bone_indices.add(name_to_index[bone_name])
+    non_limb_indices = set(skin_data.node_trs) - limb_bone_indices
+    assert non_limb_indices, "cow: se esperaban huesos fuera de las 4 patas (columna, cabeza...)"
+
+    combined, _ = solve_gait_cycle_pose(
+        skin_data, limbs, tree, hierarchy, 0.3, direction, offsets, amplitudes
+    )
+
+    for node_index in non_limb_indices:
+        bind_rotation = skin_data.node_trs[node_index].rotation
+        assert np.array_equal(combined[node_index], bind_rotation), (
+            f"cow: el hueso {skin_data.node_name[node_index]} (fuera de "
+            "cualquier pata) no quedó en bind pose tras solve_gait_cycle_pose"
+        )
+
+
+def test_phase_zero_offset_limbs_at_forward_extreme(skeleton_and_skin_by_model):
+    """Confirma que el desfase realmente se aplica (no solo que todo
+    converge a algún punto cualquiera): en global_phase=0.0, las patas
+    con phase_offset=0.0 deben resolver su pie cerca del extremo "hacia
+    adelante" de SU propio ciclo local (phase=0.0), y las de
+    phase_offset=0.5 cerca del extremo "hacia atrás" (phase=0.5).
+
+    Verificación explícita por cinemática directa sobre el dict
+    COMBINADO devuelto por `solve_gait_cycle_pose` (no se confía en
+    `IKResult.final_error` de cada pata por separado, aunque ya debería
+    reflejar esto — comparar la posición real del pie tras combinar es
+    una prueba más directa e independiente)."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model["cow"]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+    offsets = assign_limb_phase_offsets(limbs, tree, direction)
+    amplitudes = compute_safe_amplitudes(limbs, tree, hierarchy, direction)
+
+    combined, results = solve_gait_cycle_pose(
+        skin_data, limbs, tree, hierarchy, 0.0, direction, offsets, amplitudes
+    )
+
+    for limb in limbs:
+        assert results[limb.chain_root].converged
+
+        bind_foot = np.array(tree.nodes[limb.foot_leaf]["pos"], dtype=np.float64)
+        chain_root_pos = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+        local_phase = offsets[limb.chain_root]  # global_phase=0.0 + offset
+        expected_target = foot_target_at_phase(
+            bind_foot, chain_root_pos, direction, local_phase,
+            stride_amplitude_pct=amplitudes[limb.chain_root],
+        )
+
+        tip_index, tip_offset = tip_bone_and_offset(skin_data, limb, hierarchy, bind_foot)
+        resolved_foot = foot_position_given_rotations(skin_data, tip_index, tip_offset, combined)
+
+        error = float(np.linalg.norm(resolved_foot - expected_target))
+        assert error < 1e-3, (
+            f"cow chain_root={limb.chain_root} (phase_offset="
+            f"{offsets[limb.chain_root]}): el pie resuelto en el dict combinado "
+            f"está a {error} de su propio objetivo de fase local {local_phase}"
+        )
