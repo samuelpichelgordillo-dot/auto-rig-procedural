@@ -7,3 +7,4 @@ networkx>=3.2
 trimesh>=4.0
 pygltflib>=1.16
 numpy>=1.26
+matplotlib>=3.8

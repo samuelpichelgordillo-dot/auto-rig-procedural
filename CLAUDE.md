@@ -995,6 +995,21 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   **Verificación:** `pytest backend/tests/` completo → **62 passed**, 0
   failed.
 
+  **Depuración visual** (`backend/scripts/_plot_leg_reach_debug.py`,
+  nuevo, matplotlib puro sin Blender — no forma parte de los tests):
+  dibuja en 2D (plano `stride_direction`/Y, origen en `chain_root`) la
+  cadena de huesos en bind pose + los 30 objetivos del ciclo,
+  verde/rojo según si `solve_ik_ccd` converge. Generado para
+  `chain_root=3` antes (`--max-iterations 500`,
+  `samples/_debug/cow_root3_before_fix.png`, 27/30, los 3 puntos rojos
+  agrupados en el lado de "zancada hacia atrás") y después
+  (`cow_root3_after_fix.png`, 30/30) del fix, y para `chain_root=27`
+  (`cow_root27_after_fix.png`, muestra visualmente el arco de objetivos
+  mucho más pequeño tras el recorte de amplitud — el otro tipo de fix,
+  por magnitud en vez de por presupuesto de iteraciones). Añadido
+  `matplotlib` a `requirements.txt` (ya estaba instalado transitivamente,
+  ahora es una dependencia directa).
+
   Fallo direccional de `chain_root=3` cerrado y verificado. Todavía
   pendiente del Módulo 3: coordinación de varias patas moviéndose a la
   vez, desfase de fase entre ellas, dirección de zancada automática y
