@@ -62,17 +62,58 @@ def compute_hinge_axes(
     eje de flexión de una bisagra real (rodilla, codo, dedo...) en su
     postura de reposo.
 
-    **Caso 1 — articulación excluida a propósito (cadera/hombro pegada
-    a la raíz del esqueleto)**: si `GP = hierarchy[P]` es `None` (P, el
-    padre de este hueso, ES la raíz del propio esqueleto — pasa con la
-    cadena_root de cow y con la pata bat `chain_root=17`; con
-    `chain_root=15` de bat, de un solo hueso, pasa para su ÚNICO hueso,
-    así que esa pata entera queda sin ninguna entrada), no hay abuelo
-    del que derivar un "entrante" — esta es la articulación MÁS
-    proximal de la pata (cadera/hombro), anatómicamente más "bola" que
-    "bisagra" (se mueve en más de un plano de forma natural), así que
-    no le corresponde un único eje aquí. Se excluye del resultado a
-    propósito, no es un caso que "falte cubrir".
+    **Caso 1 — articulación excluida a propósito (pivote de
+    cadera/hombro de la pata)**: se excluye el hueso que TERMINA en
+    `limb.chain_root` — es decir, `chain_bone_names(limb, hierarchy)[-1]`
+    (el último de la lista, en orden pie-a-raíz) — porque ese hueso es,
+    POR DEFINICIÓN, el pivote más proximal de la pata ENTERA (ver
+    `limb_classification.LimbChain`: `chain_root` es "el hueso concreto
+    de cadera/hombro de esa pata"), así que siempre debe tratarse como
+    "bola" en vez de "bisagra", sin importar cuántos niveles de
+    jerarquía lo separen de la raíz literal del esqueleto. Además, por
+    seguridad, también se excluye si `GP = hierarchy[P]` es `None` (P,
+    el padre de este hueso, ES la raíz del propio esqueleto) — un caso
+    que en los 3 samples actuales siempre coincide con el anterior
+    (nunca aporta una exclusión que la primera condición no cubra ya),
+    pero se mantiene por si algún modelo futuro presenta un caso
+    intermedio que la primera condición no cubriera.
+
+    **Corrección de un bug real (2026-08-21, encontrado prototipando la
+    integración con `ik_solver.solve_ik_ccd` — no por un test que
+    fallara; ver nota de aprendizaje al final)**: la versión original de
+    este criterio usaba SOLO `GP is None`, asumiendo que el pivote de
+    cadera/hombro cuelga siempre directamente de la raíz del esqueleto.
+    Es cierto para las patas delanteras de cow (`bone_2_27`, `bone_2_3`)
+    y para bat (`bone_13_17`), pero FALSO para las patas TRASERAS de cow
+    — su pivote real es `bone_4_31`/`bone_4_33`, y el nodo `4` (pelvis)
+    SÍ tiene padre propio en la jerarquía (no es la raíz), así que con
+    el criterio antiguo NO se excluían: `bone_4_31`/`bone_4_33` se
+    trataban como bisagra estricta, con un eje calculado igual que
+    cualquier otro hueso. Mismo problema en biped: `bone_32_5` (cadera)
+    caía en la rama de "geometría degenerada" (Caso 2) y heredaba un eje
+    de `bone_5_71` en vez de excluirse.
+
+    Con un CCD restringido a los ejes calculados (prototipo fuera de
+    este entorno, sin Blender, pygltflib/trimesh/numpy puro), sin ningún
+    grado de libertad de "bola" en esas patas la convergencia se rompía
+    para varias fases reales del ciclo de marcha: `chain_root=31`
+    fallaba en 14 de 24 fases, `chain_root=33` en 3 de 24 (dirección de
+    zancada real de `detect_stride_direction`, amplitudes de
+    `safe_stride_amplitude_pct`) — 0 fallos tras el fix, verificado
+    independientemente. Consistente con lo esperable: sin poder rotar
+    libremente en el pivote de cadera, CCD pierde precisamente el grado
+    de libertad que más alcance aporta a toda la pata.
+
+    **Aprendizaje explícito**: los tests originales de
+    `compute_hinge_axes` (`test_hip_shoulder_pivot_excluded`,
+    concretamente) solo comprobaban que la función SE COMPORTABA como
+    decía su propio criterio (`GP is None` → excluido) — no comprobaban
+    que ese criterio en sí fuera correcto para TODAS las topologías de
+    pata presentes en los samples. Un test que verifica fielmente una
+    regla de diseño equivocada pasa igual de verde que uno que verifica
+    una regla correcta — la propiedad general que de verdad hacía falta
+    comprobar (`chain_bone_names(...)[-1]` nunca en el resultado, para
+    CUALQUIER pata) se añadió después del fix, no antes.
 
     **Caso 2 — geometría casi degenerada (cadena casi estirada en bind
     pose)**: si el ángulo entre `incoming` y `outgoing` está fuera de
@@ -99,6 +140,7 @@ def compute_hinge_axes(
     vez de inventar un eje arbitrario para ese caso.
     """
     bone_names = chain_bone_names(limb, hierarchy)
+    pivot_bone_name = bone_names[-1]  # el hueso que termina en limb.chain_root
 
     resolved: dict[str, np.ndarray] = {}
     pending: list[str] = []
@@ -109,8 +151,8 @@ def compute_hinge_axes(
         tail_node = int(child_str)
         grandparent_node = hierarchy[head_node]
 
-        if grandparent_node is None:
-            continue  # Caso 1: cadera/hombro pegada a la raíz, se excluye a propósito.
+        if bone_name == pivot_bone_name or grandparent_node is None:
+            continue  # Caso 1: pivote de cadera/hombro, se excluye a propósito.
 
         pos_head = np.array(tree.nodes[head_node]["pos"], dtype=np.float64)
         pos_tail = np.array(tree.nodes[tail_node]["pos"], dtype=np.float64)

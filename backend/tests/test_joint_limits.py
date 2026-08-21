@@ -72,11 +72,16 @@ def _direct_hinge_axis(tree, hierarchy, bone_name: str) -> np.ndarray:
 # umbral de degeneración (>20°, bien lejos de los 10° de margen) —
 # identificados inspeccionando los ángulos reales de cada hueso de la
 # cadena antes de escribir este test (no elegidos a ciegas):
-#   chain_root=31: bone_31_10 (107.5°), bone_4_31 (25.1°)
+#   chain_root=31: bone_31_10 (107.5°)
+#   chain_root=33: bone_12_34 (95.2°)
 #   chain_root=3:  bone_3_29 (34.6°)
+# `bone_4_31` (25.1°) se usaba aquí originalmente pero, tras la
+# corrección 2026-08-21, es el PIVOTE de `chain_root=31` — se excluye a
+# propósito de `compute_hinge_axes` (ya no tiene eje calculado que
+# comparar), así que se sustituyó por `bone_12_34`.
 _COW_WELL_DEFINED_BONES = [
     (31, "bone_31_10"),
-    (31, "bone_4_31"),
+    (33, "bone_12_34"),
     (3, "bone_3_29"),
 ]
 
@@ -95,36 +100,50 @@ def test_hinge_axis_matches_direct_formula_for_well_defined_joints(
     np.testing.assert_allclose(computed[bone_name], direct, atol=1e-9)
 
 
-@pytest.mark.parametrize("model,expected_excluded", [("cow", ["bone_2_27", "bone_2_3"]), ("bat", ["bone_13_17"])])
-def test_hip_shoulder_pivot_excluded(tree_and_limbs_by_model, model, expected_excluded):
-    """El hueso cuyo padre (P) es la raíz del propio esqueleto (GP =
-    hierarchy[P] is None) no debe aparecer en el resultado — es la
-    articulación más proximal (cadera/hombro), anatómicamente más "bola"
-    que "bisagra"."""
+@pytest.mark.parametrize("model", _MODELS)
+def test_hip_shoulder_pivot_excluded(tree_and_limbs_by_model, model):
+    """El pivote más proximal de CADA pata (`chain_bone_names(...)[-1]`,
+    el hueso que termina en `chain_root` — ver `limb_classification.LimbChain`)
+    no debe aparecer en el resultado, para TODAS las patas de los 3
+    modelos, sin excepción — es la articulación más proximal
+    (cadera/hombro), anatómicamente más "bola" que "bisagra".
+
+    Corrección 2026-08-21: la versión original de este test solo
+    comprobaba cow (patas delanteras) y bat con nombres de hueso
+    hardcodeados a mano — precisamente los dos casos donde el criterio
+    ANTIGUO (`GP is None`) coincidía con el correcto por casualidad. No
+    cubría las patas TRASERAS de cow ni biped, donde el criterio antiguo
+    fallaba en silencio (ver checkpoint de corrección en CLAUDE.md y
+    `test_pivot_exclusion_matches_chain_root_bone`, la propiedad general
+    que el bug violaba). Ahora es genérico: no depende de conocer de
+    memoria qué hueso es el pivote de cada pata en cada modelo, lo
+    deriva directamente de `chain_bone_names`.
+
+    También comprueba, donde aplique, el caso `GP is None` (el hueso
+    cuyo padre P es la raíz del propio esqueleto) — sigue siendo un caso
+    real (cow patas delanteras, bat), y `compute_hinge_axes` lo mantiene
+    como condición adicional de seguridad."""
     tree, hierarchy, limbs_by_root = tree_and_limbs_by_model[model]
     limbs = list(limbs_by_root.values())
 
     for limb in limbs:
         computed = compute_hinge_axes(limb, hierarchy, tree)
-        for bone_name in chain_bone_names(limb, hierarchy):
+        bone_names = chain_bone_names(limb, hierarchy)
+        pivot_bone_name = bone_names[-1]
+
+        assert pivot_bone_name not in computed, (
+            f"{model} chain_root={limb.chain_root}: el pivote {pivot_bone_name} "
+            "no debería aparecer en el resultado"
+        )
+
+        for bone_name in bone_names:
             _, parent_str, _ = bone_name.split("_")
             grandparent = hierarchy[int(parent_str)]
             if grandparent is None:
                 assert bone_name not in computed, (
-                    f"{model}: {bone_name} tiene GP=None (pivote de cadera/"
-                    "hombro pegado a la raíz) y no debería aparecer en el resultado"
+                    f"{model}: {bone_name} tiene GP=None y no debería aparecer "
+                    "en el resultado"
                 )
-
-    # Confirma también, explícitamente, que los huesos esperados sí caen
-    # en ese caso (no solo que "si caen, se excluyen" — que de verdad caigan).
-    all_excluded = set()
-    for limb in limbs:
-        computed = compute_hinge_axes(limb, hierarchy, tree)
-        for bone_name in chain_bone_names(limb, hierarchy):
-            if bone_name not in computed:
-                all_excluded.add(bone_name)
-    for bone_name in expected_excluded:
-        assert bone_name in all_excluded, f"{model}: se esperaba {bone_name} excluido"
 
 
 def test_degenerate_joints_inherit_from_neighbor(tree_and_limbs_by_model):
@@ -132,14 +151,25 @@ def test_degenerate_joints_inherit_from_neighbor(tree_and_limbs_by_model):
     ángulos reales aquí (no hardcodeados de memoria), y confirma que
     `compute_hinge_axes` los incluye en el resultado (heredaron un eje,
     no se omitieron) con un eje EXACTAMENTE igual al de algún vecino
-    resuelto en la cadena."""
+    resuelto en la cadena.
+
+    Corrección 2026-08-21: `bone_32_5` (cadera de `chain_root=5`) tiene
+    un ángulo degenerado (8.27°) pero es TAMBIÉN el pivote de su pata
+    (`chain_bone_names(...)[-1]`) — con el fix de exclusión, se excluye
+    en vez de heredar. Se filtra explícitamente aquí (igual que
+    `compute_hinge_axes` filtra internamente) para no esperar una
+    herencia que ya no ocurre; los huesos degenerados que SÍ deben
+    heredar quedan solo `bone_192_240` y `bone_141_174`."""
     tree, hierarchy, limbs_by_root = tree_and_limbs_by_model["biped"]
     limbs = list(limbs_by_root.values())
 
     degenerate_bones = []  # (chain_root, bone_name)
     resolved_bones = []  # (chain_root, bone_name)
     for limb in limbs:
+        pivot_bone_name = chain_bone_names(limb, hierarchy)[-1]
         for bone_name in chain_bone_names(limb, hierarchy):
+            if bone_name == pivot_bone_name:
+                continue  # pivote de cadera: se excluye, no se evalúa para herencia.
             _, parent_str, child_str = bone_name.split("_")
             head_node, tail_node = int(parent_str), int(child_str)
             grandparent_node = hierarchy[head_node]
@@ -200,6 +230,29 @@ def test_all_returned_axes_are_unit_length(tree_and_limbs_by_model, model):
             )
 
 
+@pytest.mark.parametrize("model", _MODELS)
+def test_pivot_exclusion_matches_chain_root_bone(tree_and_limbs_by_model, model):
+    """La propiedad general que el bug de corrección 2026-08-21 violaba
+    en silencio, para TODAS las patas de los 3 modelos, sin excepciones:
+    `chain_bone_names(limb, hierarchy)[-1]` (el hueso que termina en
+    `limb.chain_root`, el pivote más proximal de la pata ENTERA por
+    definición) nunca debe aparecer en el resultado de
+    `compute_hinge_axes` — sin importar cuántos niveles de jerarquía lo
+    separen de la raíz literal del esqueleto. Este es el test que habría
+    cazado el bug antes de llegar a un prototipo de integración con
+    `solve_ik_ccd`: los tests anteriores solo comprobaban que la función
+    hacía lo que su propio criterio (entonces incorrecto) decía, no esta
+    propiedad general."""
+    tree, hierarchy, limbs_by_root = tree_and_limbs_by_model[model]
+    for limb in limbs_by_root.values():
+        pivot_bone_name = chain_bone_names(limb, hierarchy)[-1]
+        computed = compute_hinge_axes(limb, hierarchy, tree)
+        assert pivot_bone_name not in computed, (
+            f"{model} chain_root={limb.chain_root}: el pivote {pivot_bone_name} "
+            "no debería aparecer en el resultado, sin excepciones"
+        )
+
+
 # --- hinge_axes_in_local_frame ---
 
 
@@ -233,7 +286,7 @@ def _rotate_vector_by_quat(vector: np.ndarray, quat: np.ndarray) -> np.ndarray:
 # test_hinge_axis_matches_direct_formula_for_well_defined_joints.
 _COW_WELL_DEFINED_BONES_2 = [
     (31, "bone_31_10"),
-    (31, "bone_4_31"),
+    (33, "bone_12_34"),
     (3, "bone_3_29"),
 ]
 

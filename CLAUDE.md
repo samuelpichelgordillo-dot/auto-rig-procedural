@@ -1421,3 +1421,89 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   `solve_ik_ccd` usando estos ejes locales (esta tarea tampoco lo
   hace), resolución del signo de `stride_direction`, y la pose de
   "asombro".
+
+- **[Módulo 3 — CORRECCIÓN: pivote de cadera mal excluido en patas
+  traseras] 2026-08-21** — Bug real en `compute_hinge_axes`
+  (checkpoint del `bfe4e26`), encontrado prototipando la integración
+  con `ik_solver.solve_ik_ccd` fuera de este entorno (sin Blender,
+  pygltflib/trimesh/numpy puro) — NO por un test que fallara.
+
+  **El bug**: el criterio de exclusión original (`if grandparent_node
+  is None: continue`) asumía que el pivote de cadera/hombro de una pata
+  cuelga SIEMPRE directamente de la raíz del esqueleto. Cierto para las
+  patas delanteras de cow (`bone_2_27`, `bone_2_3`) y para bat
+  (`bone_13_17`), pero FALSO para las patas TRASERAS de cow: su pivote
+  real es `bone_4_31`/`bone_4_33`, y el nodo `4` (pelvis) SÍ tiene padre
+  propio en la jerarquía (no es la raíz) — así que con el criterio
+  antiguo NO se excluían, se trataban como bisagra estricta con un eje
+  calculado igual que cualquier otro hueso. Mismo problema en biped:
+  `bone_32_5` (cadera) caía en la rama de "geometría degenerada"
+  (ángulo 8.27°) y heredaba un eje de `bone_5_71` en vez de excluirse.
+  Verificado y reproducido directamente antes de tocar nada:
+  `chain_bone_names(limb, hierarchy)[-1] not in compute_hinge_axes(...)`
+  era `False` para `chain_root=31`, `chain_root=33` (cow) y ambas patas
+  de biped — solo bat coincidía con el criterio correcto por casualidad
+  (su pivote SÍ cuelga literalmente de la raíz).
+
+  **Impacto verificado (fuera de este entorno)**: con un CCD restringido
+  a los ejes calculados, sin ningún grado de libertad de "bola" en el
+  pivote de cadera, la convergencia se rompía para varias fases reales
+  del ciclo de marcha (dirección de zancada real de
+  `detect_stride_direction`, amplitudes de `safe_stride_amplitude_pct`):
+  `chain_root=31` fallaba en **14 de 24 fases**, `chain_root=33` en
+  **3 de 24** — **0 fallos tras el fix**, verificado independientemente.
+  Consistente con lo esperable: sin poder rotar libremente en la
+  cadera, CCD pierde precisamente el grado de libertad que más alcance
+  aporta a toda la pata.
+
+  **El fix**: el pivote más proximal de una pata se identifica por
+  DEFINICIÓN — es `chain_bone_names(limb, hierarchy)[-1]` (el hueso que
+  termina en `limb.chain_root`, ver `limb_classification.LimbChain`),
+  no por la profundidad de su propio abuelo topológico. Nueva
+  condición: excluir si `bone_name == bone_names[-1]` **O**
+  `grandparent_node is None` (esta segunda condición se mantiene, sin
+  coste, por si algún modelo futuro presenta un caso intermedio que la
+  primera no cubriera — en los 3 samples actuales nunca aporta una
+  exclusión que la primera no cubra ya).
+
+  **Aprendizaje explícito, documentado en el propio docstring de
+  `compute_hinge_axes`**: los tests originales
+  (`test_hip_shoulder_pivot_excluded`) solo comprobaban que la función
+  SE COMPORTABA como decía su propio criterio (`GP is None` →
+  excluido) — no comprobaban que ese criterio en sí fuera correcto para
+  TODAS las topologías de pata presentes en los samples. Un test que
+  verifica fielmente una regla de diseño equivocada pasa igual de verde
+  que uno que verifica una regla correcta. La propiedad general que de
+  verdad hacía falta (`chain_bone_names(...)[-1]` nunca en el resultado,
+  sin excepciones, para CUALQUIER pata) se añadió DESPUÉS del fix, como
+  `test_pivot_exclusion_matches_chain_root_bone` — es el test que
+  habría cazado esto antes de llegar a un prototipo de integración.
+
+  **Ajustes en tests existentes**:
+  - `test_hip_shoulder_pivot_excluded`: antes solo cubría cow (patas
+    delanteras) y bat con nombres hardcodeados; ahora es genérico y
+    parametrizado por los 3 modelos, derivando el pivote de cada pata
+    de `chain_bone_names(...)[-1]` en vez de conocerlo de memoria.
+  - `test_degenerate_joints_inherit_from_neighbor`: `bone_32_5` ya no
+    se espera que herede (se excluye, es el pivote de `chain_root=5`)
+    — filtrado explícitamente antes de la detección de huesos
+    degenerados; los que sí heredan quedan solo `bone_192_240` y
+    `bone_141_174`.
+  - `_COW_WELL_DEFINED_BONES` (dos tests que la usan): `bone_4_31`
+    (25.1°, usado en 2 tests como "hueso bien definido") es ahora el
+    pivote de `chain_root=31` y ya no tiene eje calculado — sustituido
+    por `bone_12_34` de `chain_root=33` (95.2°, igual de bien definido).
+
+  **`backend/tests/test_joint_limits.py`**: 21 tests (antes 17) — el
+  test de exclusión ampliado a los 3 modelos (+1 combinación) y el
+  nuevo `test_pivot_exclusion_matches_chain_root_bone` (+3, uno por
+  modelo).
+
+  **Verificación:** `pytest backend/tests/` completo → **98 passed**, 0
+  failed (94 de antes + 4 nuevos/ampliados).
+
+  Bug de exclusión de pivote corregido y verificado en los 3 modelos.
+  Sigue pendiente del Módulo 3: APLICAR el límite de ángulo de verdad
+  dentro de `solve_ik_ccd` (ahora con el criterio de exclusión ya
+  correcto), resolución del signo de `stride_direction`, y la pose de
+  "asombro".
