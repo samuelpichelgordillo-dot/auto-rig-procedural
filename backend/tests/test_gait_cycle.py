@@ -46,27 +46,45 @@ _NUM_PHASE_SAMPLES = 30
 
 # --- Qué patas se prueban contra el solver de IK, y por qué ---
 #
-# id, modelo, chain_root, ¿ya convergía bien SIN recorte de amplitud
-# (baseline conocido, checkpoint 2026-08-20)?, techo de iteraciones
-# esperado con margen generoso (no un valor exacto — solo para detectar
-# una regresión real, "mismo orden de magnitud" que pide la tarea).
+# TODAS las patas de los 3 modelos (8 en total) — ya no vale probar solo
+# una por modelo, precisamente porque `chain_root=3` (checkpoint
+# 2026-08-21) reveló un problema DIRECCIONAL que el test anterior no
+# habría detectado con una sola pata "representativa" por modelo.
 #
-# - cow chain_root=31: la PRIMERA que devuelve `classify_support_limbs`
-#   para cow — ya convergía con margen (158 de 500 iteraciones) con
-#   stride_amplitude_pct=0.3 sin recortar. Debe seguir sin recortarse.
-# - cow chain_root=27: la que motivó esta tarea — con amplitud fija 0.3
-#   pedía objetivos hasta el 92% de su longitud física máxima en varias
-#   fases y NO convergía (500/500 iteraciones, error final ~1e-4 en 4 de
-#   30 fases). Con el recorte de `safe_stride_amplitude_pct`, converge en
-#   las 30 fases con margen cómodo (ver CLAUDE.md para los números
-#   exactos). Añadida explícitamente aquí — ya no se evita.
-# - biped chain_root=5 / bat chain_root=17: primera pata de cada modelo,
-#   ya convergían bien (8 y 180 de 500 iteraciones respectivamente).
+# id, modelo, chain_root, ¿ya devuelve amplitud SIN recortar de
+# `safe_stride_amplitude_pct` (0.3)?, techo de iteraciones esperado con
+# margen generoso (no un valor exacto — solo para detectar una
+# regresión real, "mismo orden de magnitud" que pide la tarea).
+#
+# - cow chain_root=31 / chain_root=33: ya convergían con margen (158 y
+#   83 de 1000 iteraciones) sin recorte de amplitud.
+# - cow chain_root=27: con amplitud fija 0.3 pedía objetivos hasta el
+#   92% de su longitud física máxima en varias fases y no convergía
+#   (checkpoint 2026-08-20). `safe_stride_amplitude_pct` la recorta a
+#   ≈0.093; converge en las 30 fases con 325 de 1000 iteraciones.
+# - cow chain_root=3: el hallazgo de ESTA tarea — con amplitud 0.3 SIN
+#   recortar (el % de longitud máxima pedido, ~81%, no dispara el
+#   recorte de `safe_stride_amplitude_pct`) la fase "zancada hacia
+#   atrás" (phase≈0.5) necesita hasta 724 iteraciones frente a las ~150
+#   de la fase "hacia adelante" pidiendo una magnitud casi idéntica —
+#   confirmado DIRECCIONAL, no de magnitud (ver CLAUDE.md para la causa
+#   raíz completa). Resuelto subiendo `DEFAULT_MAX_ITERATIONS` a 1000
+#   (investigado y descartado: ni invertir el orden de recorrido de CCD
+#   ni amortiguar el ángulo arreglan esto de forma general — es
+#   convergencia lenta monótona, no oscilación ni un límite de alcance).
+# - biped chain_root=5/88 y bat chain_root=17/15: comprobadas también
+#   (punto 5 de la tarea — no solo cow) por si el mismo problema
+#   direccional aparecía ahí. No aparece: máximos de 9, 8, 180 y 0
+#   iteraciones respectivamente, muy por debajo del presupuesto.
 _TESTED_LIMBS = [
     ("cow_root31", "cow", 31, True, 250),
+    ("cow_root33", "cow", 33, True, 150),
     ("cow_root27", "cow", 27, False, 400),
+    ("cow_root3", "cow", 3, True, 900),
     ("biped_root5", "biped", 5, True, 60),
+    ("biped_root88", "biped", 88, True, 60),
     ("bat_root17", "bat", 17, True, 300),
+    ("bat_root15", "bat", 15, True, 50),
 ]
 
 

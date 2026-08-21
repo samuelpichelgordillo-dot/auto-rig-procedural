@@ -32,17 +32,35 @@ from backend.app.skinning_quality import (
 )
 
 # CCD converge en pocas iteraciones para la mayoría de patas/objetivos
-# probados (1-43, ver test_ik_solver.py), pero al menos una combinación
-# concreta (cow, chain_root=27, flexión de -15° sobre X) necesitó 356 —
-# comportamiento conocido de CCD "de libro" (sin amortiguación ni límites
-# articulares): para ciertas geometrías de cadena y direcciones de
-# objetivo converge mucho más despacio, sin que eso indique un bug (el
-# error baja de forma monótona hasta el objetivo, solo que a pasos
-# pequeños). 500 da margen sobre el peor caso observado sin ser
-# arbitrariamente alto; si una futura pata necesitara más, es una señal
-# de que hace falta amortiguación (damping) o una cota de ángulo por
-# paso — mejora de una fase posterior, no de este cimiento.
-DEFAULT_MAX_ITERATIONS = 500
+# probados, pero algunas combinaciones concretas necesitan mucho más —
+# el peor caso conocido (checkpoint 2026-08-20, cow `chain_root=3`,
+# ciclo de marcha hacia atrás) necesita 724. Investigado con
+# instrumentación directa del bucle (eje/ángulo elegido en cada
+# sub-paso): NO es un problema de alcance ni de oscilación — el error
+# baja de forma monótona y suave durante las 724 iteraciones (se
+# aproximadamente reduce a la mitad cada ~100 pasadas: 0.026 -> 0.009 ->
+# 0.004 -> 0.0016 -> 0.0007 -> 0.0003 -> 0.0001 -> converge). La causa
+# real: para esta dirección concreta, los dos huesos más próximos a
+# `chain_root` (`bone_3_29`, `bone_2_3`) contribuyen ángulos casi nulos
+# en cada pasada (<1.2° y <1° respectivamente, frente a varios grados en
+# la dirección que SÍ converge rápido) — CCD los da por "ya alineados"
+# porque el ÁNGULO visto desde su propio pivote es pequeño, aunque el
+# ERROR global de posición siga siendo grande; con esos dos huesos casi
+# inmóviles, el hueso más distal (`bone_29_15`) tiene que cerrar casi
+# todo el hueco él solo, y su alcance por pasada es limitado. Se probó
+# invertir el orden de recorrido (raíz->pie en vez de pie->raíz) y
+# amortiguar el ángulo por paso — ninguno de los dos arregla esto de
+# forma general (invertir el orden ayuda a unas patas/fases y empeora
+# otras; amortiguar solo hace la convergencia, ya lenta, más lenta
+# todavía) — así que la solución no es cambiar el algoritmo, es darle el
+# presupuesto de iteraciones que de verdad necesita: verificado sobre
+# las 8 patas de los 3 modelos (30 fases cada una, con la amplitud de
+# `safe_stride_amplitude_pct`) que ninguna necesita más de 724. 1000 da
+# ~35% de margen sobre ese peor caso sin ser arbitrariamente alto; si una
+# futura pata necesitara más, es una señal de que hace falta amortiguación
+# adaptativa de verdad o migrar a FABRIK — mejora de una fase posterior,
+# no de este cimiento.
+DEFAULT_MAX_ITERATIONS = 1000
 DEFAULT_TOLERANCE = 1e-4
 
 

@@ -899,3 +899,103 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   Módulo 3: coordinación de varias patas moviéndose a la vez, desfase de
   fase entre ellas, dirección de zancada automática (a partir de la
   orientación del modelo) y límites articulares.
+
+- **[Módulo 3 — fallo direccional de CCD, cow chain_root=3] 2026-08-21**
+  — Verificación independiente confirmó un segundo hallazgo pendiente:
+  `chain_root=3` de cow (otra pata delantera) no converge en varias
+  fases (phase=0.500-0.567, "zancada hacia atrás") con
+  `stride_amplitude_pct=0.3` SIN recortar — pese a que
+  `safe_stride_amplitude_pct` no la recorta, porque su distancia pedida
+  (~81% de la longitud física máxima) no supera el umbral de recorte
+  (`safe_fraction=0.87`). Confirmado exactamente como lo describía el
+  hallazgo: `phase=0.000` (zancada hacia ADELANTE, dist_pct=80.2%)
+  converge en 354 iteraciones; `phase=0.500` (zancada hacia ATRÁS,
+  dist_pct=81.3% — magnitud casi idéntica) no converge ni en 500. Esto
+  prueba que el problema es DIRECCIONAL, no de magnitud — recortar la
+  amplitud de forma uniforme (como hace `safe_stride_amplitude_pct`) NO
+  puede arreglarlo: para hacerlo tendría que recortar tanto que también
+  arruinaría la zancada hacia adelante, que no tiene ningún problema (se
+  comprobó explícitamente: con `safe_fraction=0.80` la amplitud queda en
+  0.2414 y AÚN ASÍ casi no converge en 500 iteraciones; con 0.75 la
+  amplitud colapsa a 0.0, matando la zancada completa en ambas
+  direcciones solo para arreglar una).
+
+  **Investigación de la causa raíz** (instrumentación directa del bucle
+  de CCD, imprimiendo eje/ángulo elegido en cada sub-paso de las
+  primeras iteraciones, para `phase=0.0` que converge vs `phase=0.5` que
+  no): en la fase que falla, los dos huesos más próximos a `chain_root`
+  (`bone_3_29`, el "muslo", y `bone_2_3`, el hueso de cadera/hombro que
+  termina en `chain_root`) rotan ángulos casi nulos en cada pasada
+  (máx. 1.18° y 0.41° respectivamente, sobre las primeras 5 pasadas),
+  frente a 5.39° y 0.95° en la fase que converge bien. Con esos dos
+  huesos casi inmóviles, todo el trabajo de cerrar la distancia recae en
+  el hueso más distal (`bone_29_15`, el más corto de los tres, 1.04 de
+  longitud sobre una cadena de 3.94), que no da abasto — CCD evalúa a
+  cada hueso por el ÁNGULO necesario visto desde SU PROPIO pivote, y en
+  esta dirección concreta ese ángulo resulta pequeño para los dos huesos
+  proximales aunque el ERROR global de posición siga siendo grande (el
+  vector pivote→pie y pivote→objetivo están casi alineados en dirección
+  aunque no en magnitud) — un punto ciego conocido de CCD "de libro"
+  (greedy, sin mirar el error global), no oscilación: el error decrece
+  de forma monótona y suave a lo largo de las 724 iteraciones que
+  termina necesitando (se reduce aproximadamente a la mitad cada ~100
+  pasadas: 0.026 → 0.009 → 0.004 → 0.0016 → 0.0007 → 0.0003 → 0.0001 →
+  converge), confirmado explícitamente muestreando el error cada 100
+  iteraciones hasta 900.
+
+  **Mecanismos alternativos probados y descartados** (antes de decidir
+  el fix):
+  - Amortiguar el ángulo aplicado por paso (multiplicar por un factor
+    <1): empeora las cosas — con `damping=0.5` el error tras 500
+    iteraciones sube a 0.0105 (peor que sin amortiguar, 0.00067); tiene
+    sentido, amortiguar solo hace más lento algo que ya era lento sin
+    resolver el punto ciego geométrico.
+  - Invertir el orden de recorrido de CCD (raíz→pie en vez de pie→raíz,
+    o alternar): no es una mejora general. Probado sobre las 8 patas de
+    los 3 modelos con 30 fases cada una: raíz→pie SÍ arregla
+    `chain_root=3` (583 iteraciones en vez de 724) pero EMPEORA
+    `chain_root=27` (668 en vez de 556) — ninguno de los dos órdenes
+    domina al otro, depende de la pata/fase concreta, así que cambiar el
+    orden global habría cambiado qué pata falla, no eliminado el
+    problema.
+  - **Elegido: subir `DEFAULT_MAX_ITERATIONS`** (igual que ya se hizo
+    dos veces antes en este módulo, de 50→200→500, por la misma razón:
+    convergencia lenta pero monótona, no un límite de alcance real).
+    Verificado con presupuesto amplio (1500) sobre las **8 patas de los
+    3 modelos**, 30 fases cada una, con la amplitud real de
+    `safe_stride_amplitude_pct`: CERO fallos en las 240 combinaciones
+    pata×fase, peor caso 724 iteraciones (`chain_root=3`). Subido a
+    **1000** (~35% de margen sobre 724).
+
+  **Verificación final por pata** (8 de 8, todas convergen en las 30
+  fases con `DEFAULT_MAX_ITERATIONS=1000`):
+
+  | pata | amplitud (tras `safe_stride_amplitude_pct`) | iteraciones máx. |
+  |---|---|---|
+  | cow chain_root=31 | 0.300 (sin recortar) | 158 |
+  | cow chain_root=33 | 0.300 (sin recortar) | 83 |
+  | cow chain_root=27 | 0.093 (recortada) | 325 |
+  | cow chain_root=3 | 0.300 (sin recortar) | **724** ← peor caso |
+  | biped chain_root=5 | 0.300 (sin recortar) | 8 |
+  | biped chain_root=88 | 0.300 (sin recortar) | 9 |
+  | bat chain_root=17 | 0.300 (sin recortar) | 180 |
+  | bat chain_root=15 | 0.300 (sin recortar) | 0 |
+
+  Ninguna otra pata de biped o bat mostró el mismo problema direccional
+  (punto 5 de la tarea) — el hallazgo parece específico de la geometría
+  de `chain_root=3` en cow (hueso "muslo" desproporcionadamente largo,
+  2.06 de 3.94 de longitud total de cadena, más del 50%).
+
+  **`backend/tests/test_gait_cycle.py`** ampliado de 4 a **8 patas
+  probadas** (las 4 de cow + las 2 de biped + las 2 de bat — ya no una
+  sola por modelo, precisamente para que un problema direccional como
+  este no pueda volver a pasar desapercibido con una sola pata
+  "representativa"): 24 tests (antes 16).
+
+  **Verificación:** `pytest backend/tests/` completo → **62 passed**, 0
+  failed.
+
+  Fallo direccional de `chain_root=3` cerrado y verificado. Todavía
+  pendiente del Módulo 3: coordinación de varias patas moviéndose a la
+  vez, desfase de fase entre ellas, dirección de zancada automática y
+  límites articulares.
