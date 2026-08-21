@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from backend.app.gait_cycle import (
+    assign_limb_phase_offsets,
     detect_stride_direction,
     foot_target_at_phase,
     max_chain_bone_length,
@@ -214,6 +215,100 @@ def test_stride_direction_matches_independent_recomputation(skeleton_and_skin_by
     assert angle_deg < 1.0, (
         f"{model}: ángulo entre detect_stride_direction y el recálculo "
         f"independiente = {angle_deg:.3f}°, se esperaba <1°"
+    )
+
+
+# --- assign_limb_phase_offsets ---
+
+
+@pytest.mark.parametrize("model", ["biped", "bat"])
+def test_phase_offsets_biped_and_bat_alternate(skeleton_and_skin_by_model, model):
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+
+    offsets = assign_limb_phase_offsets(limbs, tree, direction)
+
+    assert len(offsets) == 2
+    assert set(offsets.values()) == {0.0, 0.5}
+
+
+def _independent_cow_diagonal_pairs(tree, limbs) -> dict[int, str]:
+    """Recálculo independiente del agrupamiento diagonal de cow, con
+    numpy directamente sobre las posiciones reales de `chain_root` y
+    `foot_leaf` de los 4 `LimbChain` — NO reutiliza
+    `assign_limb_phase_offsets` (mismo patrón que
+    `_independent_stride_direction` en este archivo). Devuelve
+    `chain_root -> "A"/"B"`, agrupando por signo relativo de la
+    proyección delante/detrás (chain_root) y lado (foot_leaf, no
+    chain_root — las dos patas traseras comparten chain_root_position,
+    ver docstring de `assign_limb_phase_offsets`)."""
+    direction = detect_stride_direction(limbs, tree)
+    side_axis = np.cross(np.array([0.0, 1.0, 0.0]), direction)
+    side_axis = side_axis / np.linalg.norm(side_axis)
+
+    chain_root_pos = {
+        limb.chain_root: np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+        for limb in limbs
+    }
+    foot_pos = {
+        limb.chain_root: np.array(tree.nodes[limb.foot_leaf]["pos"], dtype=np.float64)
+        for limb in limbs
+    }
+    chain_root_centroid = np.mean(list(chain_root_pos.values()), axis=0)
+    foot_centroid = np.mean(list(foot_pos.values()), axis=0)
+
+    groups = {}
+    for limb in limbs:
+        proj_front = np.dot(chain_root_pos[limb.chain_root] - chain_root_centroid, direction)
+        proj_side = np.dot(foot_pos[limb.chain_root] - foot_centroid, side_axis)
+        groups[limb.chain_root] = "A" if np.sign(proj_front) == np.sign(proj_side) else "B"
+    return groups
+
+
+def test_phase_offsets_cow_diagonal_pairs(skeleton_and_skin_by_model):
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model["cow"]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+
+    offsets = assign_limb_phase_offsets(limbs, tree, direction)
+    independent_groups = _independent_cow_diagonal_pairs(tree, limbs)
+
+    pair_a = [root for root, group in independent_groups.items() if group == "A"]
+    pair_b = [root for root, group in independent_groups.items() if group == "B"]
+    assert len(pair_a) == 2 and len(pair_b) == 2
+
+    assert offsets[pair_a[0]] == offsets[pair_a[1]], (
+        f"cow: el par diagonal {pair_a} (recalculado de forma independiente) "
+        "debería recibir el mismo phase_offset"
+    )
+    assert offsets[pair_b[0]] == offsets[pair_b[1]], (
+        f"cow: el par diagonal {pair_b} (recalculado de forma independiente) "
+        "debería recibir el mismo phase_offset"
+    )
+    assert offsets[pair_a[0]] != offsets[pair_b[0]], (
+        "cow: los dos pares diagonales deberían recibir phase_offset distinto"
+    )
+
+
+def test_phase_offsets_invariant_to_input_order(skeleton_and_skin_by_model):
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model["cow"]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+
+    offsets_forward = assign_limb_phase_offsets(limbs, tree, direction)
+    offsets_reversed = assign_limb_phase_offsets(list(reversed(limbs)), tree, direction)
+
+    def pairs_by_group(offsets: dict[int, float]) -> set[frozenset[int]]:
+        by_value: dict[float, list[int]] = {}
+        for chain_root, value in offsets.items():
+            by_value.setdefault(value, []).append(chain_root)
+        return {frozenset(roots) for roots in by_value.values()}
+
+    assert pairs_by_group(offsets_forward) == pairs_by_group(offsets_reversed), (
+        "el agrupamiento relativo (qué patas comparten phase_offset) no debería "
+        "depender del orden de entrada de `limbs`, aunque el valor absoluto "
+        "0.0/0.5 asignado a cada grupo pueda invertirse"
     )
 
 

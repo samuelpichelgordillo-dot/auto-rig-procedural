@@ -45,10 +45,11 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 - **Módulo actual:** 3 — Animación procedural básica (en curso)
 - **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
   clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
-  trayectoria de ciclo para una sola pata hechas y verificadas; falta
-  coordinar varias patas (desfase entre ellas, dirección de zancada
-  automática), límites articulares y la pose de "asombro" antes de poder
-  cerrarlo.
+  trayectoria de ciclo para una sola pata + dirección de zancada
+  automática + reparto de fase entre patas hechas y verificadas; falta
+  conectar el patrón de fases a un bucle real de varias patas con IK,
+  resolver el signo de `stride_direction`, límites articulares y la pose
+  de "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -1085,3 +1086,79 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   Todavía pendiente del Módulo 3: asignación de fases entre patas,
   patrón de marcha (trote, alternancia...), resolución del signo de
   `stride_direction`, y límites articulares.
+
+- **[Módulo 3 — reparto de fase entre patas] 2026-08-21** —
+  `assign_limb_phase_offsets(limbs, tree, stride_direction)` en
+  `gait_cycle.py`: asigna un desfase (`phase_offset`, en {0.0, 0.5}) a
+  cada pata para que varias patas puedan animarse a la vez sin pisarse
+  — `foot_target_at_phase(..., phase=fase_global + phase_offset)` ya es
+  periódica, no hizo falta tocarla. NO conecta todavía con
+  `solve_ik_ccd` en un bucle de varias patas — eso es la tarea
+  siguiente.
+
+  **Dos casos, mismo estilo de ramificación honesta que
+  `detect_stride_direction`** (solo cubre 2 o 4 patas, lo que aparece en
+  los 3 samples; cualquier otro nº lanza `NotImplementedError`
+  explícito):
+
+  - 2 patas (biped, bat): alternancia simple, ordenando por
+    `chain_root` para que sea determinista. Cuál pata "empieza" es
+    arbitrario — igual que el signo de `stride_direction`.
+  - 4 patas (cow): trote por pares diagonales. `side_axis =
+    normalizado(cross((0,1,0), stride_direction))`; para cada pata,
+    `proj_front` = proyección de `chain_root_position` sobre
+    `stride_direction` (relativa al centroide de todas las
+    `chain_root_position`) y `proj_side` = proyección de
+    `foot_leaf_position` sobre `side_axis` (relativa al centroide de
+    todas las `foot_leaf_position`); grupo `"A"` si
+    `sign(proj_front) == sign(proj_side)`, si no `"B"` — A→0.0, B→0.5.
+    Assert interno (sin silenciar) de que salen exactamente 2 patas por
+    grupo.
+
+  **Hallazgo que motivó usar `foot_leaf` en vez de `chain_root` para
+  `proj_side`** (verificado con las posiciones reales del modelo antes
+  de escribir la función, no solo intuido): las dos patas traseras de
+  cow (`chain_root=31` y `chain_root=33`) tienen EXACTAMENTE la misma
+  `chain_root_position` — `(-0.2268, 3.0065, -2.7436)` para ambas,
+  coordenada por coordenada. Esto tiene sentido con lo ya documentado en
+  el checkpoint de `limb_classification.py`: el `chain_root` de una pata
+  es el nodo justo por debajo de la bifurcación real de cadera/hombro
+  compartida por ambas patas de ese lado del cuerpo, así que dos patas
+  hermanas pueden colgar del mismo nodo antes de divergir más abajo en
+  la jerarquía. Usar `chain_root_position` para `proj_side` habría
+  colapsado la proyección lateral a un valor idéntico para ambas patas
+  traseras (`sign(0)` es ambiguo/inestable), rompiendo el agrupamiento
+  por pares. `foot_leaf_position` no tiene este problema — es
+  literalmente el punto de apoyo en el suelo, nunca compartido entre dos
+  patas distintas.
+
+  **Verificación visual** (`backend/scripts/_plot_phase_offsets_debug.py`,
+  nuevo, matplotlib sin Blender, mismo patrón que
+  `_plot_stride_direction_debug.py`): vista cenital (X-Z), cada pata
+  coloreada según su `phase_offset` (azul=0.0, rojo=0.5). Comprobado a
+  ojo sobre los 3 modelos (`samples/_debug/{modelo}_phase_offsets.png`):
+  en cow, los dos pares de colores quedan en DIAGONAL de verdad
+  (delantera-derecha + trasera-izquierda en un color, delantera-
+  izquierda + trasera-derecha en el otro) — no "los dos de un lado" ni
+  "delante vs atrás", que habría sido un agrupamiento con sentido
+  numérico pero conceptualmente equivocado para un trote. Biped y bat
+  alternan correctamente entre sus 2 patas.
+
+  **`backend/tests/test_gait_cycle.py`** ampliado con 4 tests nuevos
+  (34 en total, antes 30): alternancia de biped/bat (el resultado es
+  exactamente `{0.0, 0.5}` como conjunto, sin asumir qué pata recibe
+  cuál); agrupamiento diagonal de cow verificado contra un recálculo
+  INDEPENDIENTE hecho desde cero en el propio test
+  (`_independent_cow_diagonal_pairs`, mismo patrón que
+  `_independent_stride_direction`, no reutiliza la función bajo
+  prueba); e invarianza al orden de entrada de `limbs` (el agrupamiento
+  relativo no cambia si se invierte la lista, aunque el valor absoluto
+  0.0/0.5 de cada grupo sí pueda invertirse).
+
+  **Verificación:** `pytest backend/tests/` completo → **72 passed**, 0
+  failed (68 de antes + 4 nuevos).
+
+  Reparto de fase entre patas cerrado y verificado. Todavía pendiente
+  del Módulo 3: conectar este patrón de fases a un bucle real de varias
+  patas moviéndose a la vez con `solve_ik_ccd`, resolución del signo de
+  `stride_direction`, límites articulares y la pose de "asombro".

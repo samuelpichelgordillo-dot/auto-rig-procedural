@@ -396,3 +396,120 @@ def detect_stride_direction(limbs: list[LimbChain], tree: nx.Graph) -> np.ndarra
         )
 
     return direction
+
+
+def assign_limb_phase_offsets(
+    limbs: list[LimbChain],
+    tree: nx.Graph,
+    stride_direction: np.ndarray,
+) -> dict[int, float]:
+    """Asigna un desfase de fase (`phase_offset`, en {0.0, 0.5}) a cada
+    pata, para que varias patas puedan animarse a la vez sin pisarse —
+    ``foot_target_at_phase(..., phase=fase_global + phase_offset)`` ya es
+    periódica, no hace falta ningún cambio ahí (la propia periodicidad de
+    `cos`/`sin` en 2π se encarga). NO conecta todavía con `solve_ik_ccd`
+    en un bucle de varias patas — eso es la tarea siguiente.
+
+    Devuelve un dict `chain_root -> phase_offset`.
+
+    Dos casos, mismo estilo de ramificación honesta que
+    `detect_stride_direction` (solo cubre lo que aparece en los 3
+    samples de este proyecto, no un caso general para cualquier nº de
+    patas):
+
+    - **2 patas** (biped, bat): alternancia simple. Se ordenan las patas
+      por `chain_root` ascendente para que el resultado sea
+      determinista; la primera recibe 0.0, la segunda 0.5. Cuál de las
+      dos "empieza" es arbitrario — igual que el signo de
+      `stride_direction` (ver su docstring), lo único que importa aquí
+      es que las dos patas reciban valores DISTINTOS, no cuál en
+      concreto recibe cuál.
+    - **4 patas** (cow): patrón de trote por pares diagonales (delantera-
+      izquierda + trasera-derecha en fase, delantera-derecha + trasera-
+      izquierda en la opuesta — o el espejo, el signo de "izquierda" no
+      se resuelve, ver más abajo), SIN necesitar resolver el signo de
+      "adelante" ni de "izquierda":
+
+      1. `side_axis = normalizado(cross((0,1,0), stride_direction))` —
+         perpendicular horizontal a la zancada, "el otro eje horizontal".
+      2. `proj_front` de cada pata = proyección de su
+         `chain_root_position` (menos el centroide de todas las
+         `chain_root_position`) sobre `stride_direction` — positivo o
+         negativo según el LADO del eje de zancada en el que cae esa
+         pata (delante/detrás, signo arbitrario).
+      3. `proj_side` de cada pata = proyección de su `foot_leaf_position`
+         (menos el centroide de todas las `foot_leaf_position`) sobre
+         `side_axis` — igual pero para el otro lado (izquierda/derecha,
+         signo arbitrario).
+
+         **Por qué `foot_leaf` y NO `chain_root` aquí**: verificado con
+         las posiciones reales del modelo (`chain_root=31` y
+         `chain_root=33`, las dos patas traseras de cow) — comparten
+         EXACTAMENTE la misma `chain_root_position`, porque cuelgan del
+         mismo nodo de cadera antes de divergir más abajo en la
+         jerarquía (ver checkpoint de `limb_classification.py`: el
+         `chain_root` es el hueso concreto de cadera de ESA pata, pero
+         dos patas del mismo lado del cuerpo pueden compartir esa misma
+         posición si la bifurcación real está un nivel más arriba de lo
+         que separa ambas cadenas). Usar `chain_root_position` para
+         `proj_side` colapsaría la proyección lateral a ~0 para ambas
+         patas traseras y rompería el agrupamiento por pares —
+         `foot_leaf_position` sí diverge entre patas siempre (es
+         literalmente el punto de apoyo en el suelo, nunca compartido
+         entre dos patas distintas).
+      4. Grupo de cada pata: `"A"` si `sign(proj_front) == sign(proj_side)`
+         (delante-de-un-lado + detrás-del-lado-opuesto caen en el mismo
+         signo relativo), si no `"B"`. Grupo A -> `phase_offset` 0.0,
+         grupo B -> `phase_offset` 0.5.
+      5. Se comprueba internamente (`assert`, sin silenciar) que salen
+         exactamente 2 patas por grupo — si no, algo está mal en la
+         clasificación de patas de entrada (`classify_support_limbs`),
+         mejor fallar ruidosamente que devolver un reparto sin sentido.
+
+    - **Cualquier otro nº de patas**: `NotImplementedError` explícito —
+      solo 2 o 4 patas están cubiertas por los samples actuales de este
+      proyecto.
+    """
+    if len(limbs) == 2:
+        ordered = sorted(limbs, key=lambda limb: limb.chain_root)
+        return {ordered[0].chain_root: 0.0, ordered[1].chain_root: 0.5}
+
+    if len(limbs) == 4:
+        side_axis = np.cross(np.array([0.0, 1.0, 0.0]), stride_direction)
+        side_axis = side_axis / np.linalg.norm(side_axis)
+
+        chain_root_positions = {
+            limb.chain_root: np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+            for limb in limbs
+        }
+        foot_positions = {
+            limb.chain_root: np.array(tree.nodes[limb.foot_leaf]["pos"], dtype=np.float64)
+            for limb in limbs
+        }
+        chain_root_centroid = np.mean(list(chain_root_positions.values()), axis=0)
+        foot_centroid = np.mean(list(foot_positions.values()), axis=0)
+
+        groups: dict[str, list[int]] = {"A": [], "B": []}
+        offsets: dict[int, float] = {}
+        for limb in limbs:
+            proj_front = float(
+                np.dot(chain_root_positions[limb.chain_root] - chain_root_centroid, stride_direction)
+            )
+            proj_side = float(
+                np.dot(foot_positions[limb.chain_root] - foot_centroid, side_axis)
+            )
+            group = "A" if np.sign(proj_front) == np.sign(proj_side) else "B"
+            groups[group].append(limb.chain_root)
+            offsets[limb.chain_root] = 0.0 if group == "A" else 0.5
+
+        assert len(groups["A"]) == 2 and len(groups["B"]) == 2, (
+            f"assign_limb_phase_offsets: se esperaban 2 patas por grupo diagonal, "
+            f"salió A={groups['A']} B={groups['B']} — revisar classify_support_limbs "
+            "para este modelo, el reparto no tiene sentido"
+        )
+        return offsets
+
+    raise NotImplementedError(
+        f"assign_limb_phase_offsets solo cubre 2 o 4 patas (lo que aparece en "
+        f"los 3 samples de este proyecto), hay {len(limbs)}"
+    )
