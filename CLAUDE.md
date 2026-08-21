@@ -48,11 +48,11 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   trayectoria de ciclo para una sola pata + dirección de zancada
   automática + reparto de fase entre patas + pose de marcha con varias
   patas a la vez + ejes de bisagra por articulación (mundo bind pose y
-  ahora también marco local del padre) hechas y verificadas; falta
-  APLICAR el límite de ángulo de verdad dentro de `solve_ik_ccd` (esta
-  tarea tampoco lo hace — solo deja el eje local listo para usarse en
-  cualquier pose futura), resolver el signo de `stride_direction`, y la
-  pose de "asombro" antes de poder cerrarlo.
+  marco local del padre) + restricción de EJE de rotación dentro de
+  `solve_ik_ccd` hechas y verificadas; falta el límite de ÁNGULO (rango
+  de flexión/extensión dentro de cada bisagra — decisión consciente de
+  no mezclarlo con la restricción de eje), resolver el signo de
+  `stride_direction`, y la pose de "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -1507,3 +1507,86 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   dentro de `solve_ik_ccd` (ahora con el criterio de exclusión ya
   correcto), resolución del signo de `stride_direction`, y la pose de
   "asombro".
+
+- **[Módulo 3 — restricción de eje de bisagra dentro de `solve_ik_ccd`]
+  2026-08-21** — `solve_ik_ccd` acepta ahora un parámetro opcional
+  `hinge_axes_local: dict[str, np.ndarray] | None = None` (resultado de
+  `joint_limits.hinge_axes_in_local_frame`): si un hueso de la cadena
+  aparece en ese dict, su rotación en cada sub-paso de CCD se restringe
+  a girar SOLO alrededor de su eje de bisagra (1 grado de libertad) en
+  vez de la rotación libre de 3 grados de libertad de antes. El pivote
+  de cadera/hombro (excluido de `compute_hinge_axes` por diseño, ver
+  checkpoint de corrección anterior) sigue rotando libre siempre. Con
+  `hinge_axes_local=None` (el default), el comportamiento es EXACTAMENTE
+  el de antes — verificado explícitamente, no solo asumido por el
+  default.
+
+  **Alcance deliberado**: esta tarea SOLO restringe el EJE de rotación.
+  NO incluye un límite de ÁNGULO (rango de flexión/extensión dentro de
+  esa bisagra) — decisión consciente de no mezclar ambas cosas en el
+  mismo cambio, queda pendiente para una tarea posterior.
+
+  **Cálculo restringido, por hueso con eje conocido**: (1)
+  `current_axis = G_padre_rotación @ hinge_axes_local[bone_name]`,
+  normalizado — el eje de mundo válido EN ESE MOMENTO, co-rota con el
+  padre (exactamente la propiedad verificada en el checkpoint de
+  `hinge_axes_in_local_frame`). (2) `to_effector`/`to_target` se
+  proyectan sobre el plano perpendicular a `current_axis` antes de
+  normalizarlos — si alguna proyección es casi nula (los vectores
+  pivote→pie/objetivo caen casi paralelos al propio eje de bisagra, sin
+  componente de flexión que resolver desde ese pivote), se salta el
+  hueso esta pasada. (3) Ángulo CON SIGNO alrededor de `current_axis`
+  vía `arctan2(sin, cos)` en vez del `arccos` sin signo del camino
+  libre — una bisagra necesita saber en qué SENTIDO girar sobre su
+  único eje. El resto del sub-paso (composición de cuaterniones,
+  actualización del dict, recálculo de `effector`/`globals_`) es
+  idéntico para ambos caminos.
+
+  **Verificado exactamente como se especificó, sin fallos**: 0 fallos
+  en las 8 patas de los 3 modelos, 24 fases del ciclo cada una
+  (dirección de zancada real de `detect_stride_direction`, amplitudes
+  de `safe_stride_amplitude_pct`) — coincide con la verificación
+  independiente hecha antes de esta tarea (fuera de este entorno).
+  Iteraciones máximas observadas con restricción activa: cow
+  `chain_root=3` 738 (vs 724 sin restringir, mismo orden de magnitud),
+  bat `chain_root=17` 243 (vs 180 sin restringir) — algo más lento en
+  algunos casos al perder grados de libertad, pero dentro del
+  presupuesto de `DEFAULT_MAX_ITERATIONS` (1000) con margen.
+
+  **Verificación directa de la restricción** (`test_constrained_rotation_axis_matches_hinge`,
+  2 huesos de cow): fuerza un objetivo alcanzable rotando UN hueso
+  concreto 25° sobre su propio eje de bisagra (mundo, bind pose),
+  resuelve con `max_iterations=1`, extrae la rotación LOCAL delta
+  aplicada (`new_local · conj(old_local)`) y confirma que su eje es
+  paralelo/antiparalelo (coseno ≈ ±1.0) al eje local esperado — no
+  cualquier otro eje.
+
+  **Verificación visual** (`backend/scripts/_plot_constrained_pose_debug.py`,
+  nuevo, matplotlib sin Blender): silueta COMPLETA de cada pata
+  (todas las articulaciones, no solo el pie) en 5 fases del ciclo, con
+  y sin restricción de bisagra, superpuestas (vista lateral X-Y).
+  Comprobado a ojo sobre los 3 modelos
+  (`samples/_debug/{modelo}_constrained_vs_unconstrained.png`): en los
+  3 modelos las siluetas restringida y sin restringir se superponen muy
+  de cerca en las 4 patas de cow, las 2 de biped (algo más de dispersión
+  visual en el racimo de dedos del pie, denso pero no descabellado) y
+  las 2 de bat — ningún doblez de rodilla hacia el lado contrario ni
+  trayectoria descabellada en ningún caso.
+
+  **`backend/tests/test_ik_solver.py`** ampliado con 8 tests nuevos (14
+  en total, antes 6; los 6 originales siguen pasando SIN modificarlos,
+  la prueba de que el default preserva compatibilidad):
+  `test_unconstrained_behavior_unchanged` (resultados IDÉNTICOS bit a
+  bit entre no pasar el parámetro y pasar `hinge_axes_local=None`
+  explícito, 3 modelos); `test_hinge_constrained_converges_across_full_cycle`
+  (8 patas × 24 fases, cero fallos, 3 modelos); y
+  `test_constrained_rotation_axis_matches_hinge` (2 huesos de cow, la
+  verificación directa de la restricción).
+
+  **Verificación:** `pytest backend/tests/` completo → **106 passed**,
+  0 failed (98 de antes + 8 nuevos).
+
+  Restricción de eje de bisagra aplicada y verificada dentro de
+  `solve_ik_ccd`. Todavía pendiente del Módulo 3: límite de ÁNGULO
+  (rango de flexión/extensión) dentro de cada bisagra, resolución del
+  signo de `stride_direction`, y la pose de "asombro".

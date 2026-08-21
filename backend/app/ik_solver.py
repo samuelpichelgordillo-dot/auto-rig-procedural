@@ -178,6 +178,7 @@ def solve_ik_ccd(
     hierarchy: dict[int, "int | None"],
     bind_foot_position: np.ndarray,
     target_position: np.ndarray,
+    hinge_axes_local: dict[str, np.ndarray] | None = None,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> IKResult:
@@ -223,6 +224,38 @@ def solve_ik_ccd(
 
     Auto-chequeo obligatorio antes de fiarse de esto para nada más: ver
     `verify_zero_displacement_converges_immediately`.
+
+    ``hinge_axes_local`` (opcional, `None` por defecto — preserva el
+    comportamiento exacto de antes de esta restricción): resultado de
+    `joint_limits.hinge_axes_in_local_frame`, `bone_name -> eje unitario
+    en el marco LOCAL del padre en bind pose`. Si un hueso de la cadena
+    aparece en este dict, su rotación en cada sub-paso se restringe a
+    girar SOLO alrededor de ese eje (bisagra de 1 grado de libertad) en
+    vez de la rotación libre de 3 grados de libertad del camino sin
+    restringir — el pivote de cadera/hombro (excluido de
+    `compute_hinge_axes` por diseño) sigue rotando libre siempre, esté o
+    no `hinge_axes_local` presente. Esta tarea SOLO restringe el EJE de
+    rotación, no el ÁNGULO (rango de flexión/extensión dentro de esa
+    bisagra) — eso queda pendiente para una tarea posterior a propósito,
+    para no mezclar ambas cosas en un mismo cambio.
+
+    Cálculo restringido, por hueso con eje conocido: (1)
+    `current_axis = G_p_rotación @ hinge_axes_local[bone_name]`,
+    normalizado — el eje de mundo válido EN ESTE MOMENTO, co-rota con el
+    padre (ver checkpoint de `hinge_axes_in_local_frame` para por qué
+    esto es necesario en vez de usar el eje de mundo de bind pose tal
+    cual). (2) `to_effector`/`to_target` se proyectan sobre el plano
+    perpendicular a `current_axis` (se les resta su propia componente a
+    lo largo del eje) antes de normalizarlos — si alguna proyección
+    tiene norma casi nula (los vectores pivote→pie/pivote→objetivo caen
+    casi paralelos al propio eje de bisagra, sin componente de flexión
+    que resolver desde este pivote), se salta el hueso esta pasada,
+    igual que ya se salta cuando `effector_len`/`target_len` son casi
+    nulos. (3) El ángulo se calcula CON SIGNO alrededor de
+    `current_axis` (`arctan2(sin, cos)` con `sin = cross(...) ·
+    current_axis`, `cos = dot(...)`) en vez del ángulo sin signo
+    (`arccos`) del camino sin restringir — una bisagra necesita saber en
+    qué SENTIDO girar sobre su único eje, no solo cuánto.
     """
     chain_names = chain_bone_names(limb, hierarchy)
     name_to_index = name_to_node_index(skin_data)
@@ -247,7 +280,7 @@ def solve_ik_ccd(
 
     while error >= tolerance and iterations_used < max_iterations:
         iterations_used += 1
-        for node_index in chain_indices:
+        for bone_name, node_index in zip(chain_names, chain_indices):
             parent_index = skin_data.node_parent[node_index]
             pivot = globals_[node_index][:3, 3]
 
@@ -260,17 +293,39 @@ def solve_ik_ccd(
             to_effector /= effector_len
             to_target /= target_len
 
-            dot = float(np.clip(np.dot(to_effector, to_target), -1.0, 1.0))
-            angle = float(np.arccos(dot))
-            if angle < 1e-8:
-                continue
+            if hinge_axes_local is not None and bone_name in hinge_axes_local:
+                current_axis = globals_[parent_index][:3, :3] @ hinge_axes_local[bone_name]
+                current_axis = current_axis / np.linalg.norm(current_axis)
 
-            axis = np.cross(to_effector, to_target)
-            axis_norm = np.linalg.norm(axis)
-            if axis_norm < 1e-9:
-                continue  # vectores ~antiparalelos, eje de rotación indefinido
+                to_effector_proj = to_effector - np.dot(to_effector, current_axis) * current_axis
+                to_target_proj = to_target - np.dot(to_target, current_axis) * current_axis
+                effector_proj_len = np.linalg.norm(to_effector_proj)
+                target_proj_len = np.linalg.norm(to_target_proj)
+                if effector_proj_len < 1e-9 or target_proj_len < 1e-9:
+                    continue  # pivote→pie/objetivo casi paralelos al propio eje de bisagra
+                to_effector_proj /= effector_proj_len
+                to_target_proj /= target_proj_len
 
-            world_rotation = axis_angle_to_quat(axis / axis_norm, angle)
+                sin_a = float(np.dot(np.cross(to_effector_proj, to_target_proj), current_axis))
+                cos_a = float(np.clip(np.dot(to_effector_proj, to_target_proj), -1.0, 1.0))
+                signed_angle = float(np.arctan2(sin_a, cos_a))
+                if abs(signed_angle) < 1e-8:
+                    continue
+
+                world_rotation = axis_angle_to_quat(current_axis, signed_angle)
+            else:
+                dot = float(np.clip(np.dot(to_effector, to_target), -1.0, 1.0))
+                angle = float(np.arccos(dot))
+                if angle < 1e-8:
+                    continue
+
+                axis = np.cross(to_effector, to_target)
+                axis_norm = np.linalg.norm(axis)
+                if axis_norm < 1e-9:
+                    continue  # vectores ~antiparalelos, eje de rotación indefinido
+
+                world_rotation = axis_angle_to_quat(axis / axis_norm, angle)
+
             parent_global_rotation = matrix3_to_quat(globals_[parent_index][:3, :3])
             old_local = local_rotation.get(node_index, skin_data.node_trs[node_index].rotation)
 
