@@ -807,3 +807,95 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   entre ellas) y calcular `stride_direction` automáticamente a partir de
   la orientación del modelo — depende de tener esto verificado primero,
   ya lo está.
+
+- **[Módulo 3 — amplitud de zancada segura, fix de chain_root=27]
+  2026-08-20** — El hallazgo pendiente del checkpoint anterior (cow,
+  `chain_root=27`, no converge en varias fases del ciclo con
+  `stride_amplitude_pct=0.3` fijo) resuelto: con esa amplitud, la
+  distancia pedida entre `chain_root` y el objetivo llega al **92.1%**
+  de la longitud física máxima real de la cadena en `phase=0.0` (y al
+  87.0-91.9% en otras 3 fases) — ahí CCD converge extremadamente
+  despacio o no converge en absoluto en 500 iteraciones (geometría casi
+  degenerada, cadena casi totalmente estirada).
+
+  **`max_chain_bone_length(limb, hierarchy, tree)`** (nuevo en
+  `gait_cycle.py`): suma las longitudes de CADA hueso de la cadena
+  (reutilizando `ik_solver.chain_bone_names`), a diferencia de `reach`
+  (la distancia en línea recta `chain_root_position` ->
+  `bind_foot_position` que ya usaba `foot_target_at_phase` como escala)
+  — son iguales solo si la pata está perfectamente estirada en bind
+  pose. Para `chain_root=27`: `reach=3.426`, `max_chain_length=3.992`
+  (la pata ya está al 85.8% de su extensión total EN BIND POSE, antes de
+  añadir ninguna zancada).
+
+  **`safe_stride_amplitude_pct(...)`** (nuevo): búsqueda binaria sobre
+  la amplitud (muestreando la fase igual que `verify_never_below_ground`
+  — no hay forma cerrada simple, el punto más lejano de `chain_root`
+  depende de cómo se combinan el offset horizontal y el vertical, no
+  colineales en general) para encontrar la mayor amplitud ≤ la pedida
+  tal que la distancia a `chain_root` no supere `safe_fraction ·
+  max_chain_length` en ninguna fase. Si la amplitud pedida ya cumple, se
+  devuelve sin tocar — clave para no romper las patas que ya iban bien.
+
+  **Calibración de `safe_fraction` — el primer valor probado (0.85, el
+  que pedía la tarea) NO sirvió**: `chain_root=31` (la pata de cow que
+  YA convergía bien, 158 de 500 iteraciones, sin recorte) tiene su
+  propia distancia máxima natural al 86.7% de su longitud máxima con la
+  amplitud pedida (0.3) — POR ENCIMA de 0.85 — así que un `safe_fraction`
+  de 0.85 la recortaba también (a amplitud 0.238), violando el requisito
+  de no tocar las patas que ya iban bien. Subido a **0.87** (justo por
+  encima de ese 86.7%): `chain_root=31` vuelve a devolver 0.3 sin
+  recortar (158 iteraciones, idénticas a antes), y `chain_root=27` se
+  recorta a amplitud ≈0.093, convergiendo en las 30 fases con **máx. 325
+  de 500 iteraciones** (65% del presupuesto — ya no "pegado al límite").
+  Probado también con 0.92 y 0.95: el recorte es casi nulo (amplitud
+  final 0.2975-0.3) y las mismas 4 fases de `chain_root=27` siguen sin
+  converger ni con 500 iteraciones — no basta con subir el umbral, hay
+  que quedarse cerca de la banda que de verdad excluye las fases
+  problemáticas.
+
+  **Limitación honesta documentada en el propio docstring**: el % de la
+  longitud máxima alcanzado NO predice perfectamente la dificultad de
+  convergencia por sí solo — `chain_root=31` llega al 86.7% y converge
+  en 158 iteraciones, mientras que `chain_root=27` ya falla en fases con
+  un 87.0%. La geometría concreta de cada cadena (qué huesos necesitan
+  doblarse y en qué dirección) importa además del porcentaje puro. Aun
+  así, el recorte por este criterio relativo resuelve el caso conocido
+  sin tocar el que no lo necesitaba, que es el objetivo de esta tarea —
+  no una garantía general de convergencia rápida para cualquier pata
+  futura.
+
+  **Decisión de diseño (dónde vive el recorte)**: `foot_target_at_phase`
+  se mantiene como fórmula geométrica pura, sin conocer nada de
+  cinemática ni de si el resultado es alcanzable.
+  `safe_stride_amplitude_pct` es un paso EXPLÍCITO PREVIO que quien
+  genere la trayectoria de una pata llama UNA VEZ antes del bucle de
+  fases (no dentro de él) — mismo patrón que los `verify_*` ya
+  existentes: visible en el código de quien lo usa, no un efecto
+  secundario oculto dentro de la fórmula.
+
+  **`backend/tests/test_gait_cycle.py`** ampliado a 16 tests (antes 11):
+  nuevo test de regresión `test_safe_amplitude_matches_expected_clipping`
+  (las patas que ya iban bien devuelven amplitud 0.3 sin recortar; la
+  problemática se recorta a algo entre 0 y 0.3) y `chain_root=27` de cow
+  añadido explícitamente al conjunto de patas de
+  `test_ik_converges_across_full_cycle` (ya no se evita) con un techo de
+  iteraciones esperado por pata (margen generoso, no un valor exacto —
+  solo para detectar una regresión de rendimiento real):
+
+  | pata | ¿ya iba bien? | iteraciones máx. observadas | techo del test |
+  |---|---|---|---|
+  | cow chain_root=31 | sí | 158 | 250 |
+  | cow chain_root=27 | no (el fix de esta tarea) | 325 | 400 |
+  | biped chain_root=5 | sí | ~7-8 | 60 |
+  | bat chain_root=17 | sí | 180 | 300 |
+
+  **Verificación:** `pytest backend/tests/` completo → **54 passed**, 0
+  failed (49 de antes + 5 nuevos: 4 combinaciones extra de
+  `test_safe_amplitude_matches_expected_clipping`/`test_ik_converges_across_full_cycle`
+  con el mismo `chain_root=27` sumado a las 3 patas ya existentes).
+
+  Amplitud de zancada segura cerrada y verificada. Todavía pendiente del
+  Módulo 3: coordinación de varias patas moviéndose a la vez, desfase de
+  fase entre ellas, dirección de zancada automática (a partir de la
+  orientación del modelo) y límites articulares.

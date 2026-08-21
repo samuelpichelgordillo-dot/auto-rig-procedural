@@ -11,12 +11,32 @@ con el suelo respetado por construcción".
 Pensado para encadenarse con `ik_solver.solve_ik_ccd`: la salida de
 `foot_target_at_phase` es exactamente el `target_position` que espera
 ese solver.
+
+**Decisión de diseño — dónde vive la seguridad de amplitud
+(`safe_stride_amplitude_pct`)**: NO se mete dentro de
+`foot_target_at_phase` como recorte implícito. Esa función se mantiene
+como una fórmula geométrica pura (posición objetivo dada una amplitud ya
+decidida), sin conocer nada de cinemática ni de si el resultado es
+alcanzable — igual separación de responsabilidades que ya usa el
+proyecto entre "calcular algo" y los `verify_*` que lo comprueban aparte.
+`safe_stride_amplitude_pct` es un PASO EXPLÍCITO PREVIO que quien vaya a
+generar la trayectoria de una pata llama UNA VEZ (no en cada fase) antes
+del bucle de fases, para decidir qué `stride_amplitude_pct` usar en las
+llamadas a `foot_target_at_phase` de ese ciclo completo — así
+`foot_target_at_phase` sigue siendo determinista y fácil de razonar de
+forma aislada, y el ajuste de seguridad es visible y opcional en el
+código de quien la usa (`test_gait_cycle.py` es el primer caso real de
+este flujo), no un efecto secundario oculto.
 """
 from __future__ import annotations
 
 import math
 
+import networkx as nx
 import numpy as np
+
+from backend.app.ik_solver import chain_bone_names
+from backend.app.limb_classification import LimbChain
 
 _STRIDE_DIRECTION_Y_TOLERANCE = 1e-6
 
@@ -149,3 +169,149 @@ def verify_never_below_ground(
             f"bind pose: déficit máximo {-min_margin} >= tolerancia {tolerance}"
         )
     return min_margin
+
+
+def max_chain_bone_length(limb: LimbChain, hierarchy: dict[int, "int | None"], tree: nx.Graph) -> float:
+    """Longitud física máxima real de la cadena de la pata: suma de las
+    longitudes de CADA hueso desde `chain_root` hasta `foot_leaf` (no la
+    distancia en línea recta `chain_root_position` -> `bind_foot_position`
+    que usa `foot_target_at_phase` como escala — esa es una cota inferior
+    de esta, coinciden solo si la pata está perfectamente estirada en
+    bind pose).
+
+    Reutiliza `ik_solver.chain_bone_names` para obtener los huesos de la
+    cadena en orden (cada nombre "bone_P_C" es una arista del árbol de
+    esqueleto) y mide la distancia real entre esos dos nodos en `tree`
+    (mismo árbol que produjo `hierarchy` — `build_skeleton_tree`).
+
+    Es el límite kinemático DURO de la pata: con huesos rígidos y sin
+    límites articulares (los límites articulares son una fase
+    posterior), ningún punto a más de esta distancia de `chain_root` es
+    alcanzable, sin importar cuánto itere CCD.
+    """
+    total_length = 0.0
+    for bone_name in chain_bone_names(limb, hierarchy):
+        _, parent_str, child_str = bone_name.split("_")
+        parent_pos = tree.nodes[int(parent_str)]["pos"]
+        child_pos = tree.nodes[int(child_str)]["pos"]
+        total_length += math.dist(parent_pos, child_pos)
+    return total_length
+
+
+def safe_stride_amplitude_pct(
+    bind_foot_position: np.ndarray,
+    chain_root_position: np.ndarray,
+    max_chain_length: float,
+    stride_direction: np.ndarray,
+    lift_height_pct: float = 0.15,
+    safe_fraction: float = 0.87,
+    requested_amplitude_pct: float = 0.3,
+    num_phase_samples: int = 200,
+    num_search_iterations: int = 40,
+) -> float:
+    """Mayor ``stride_amplitude_pct`` ≤ ``requested_amplitude_pct`` tal
+    que, en NINGUNA fase del ciclo, la distancia entre ``chain_root_position``
+    y el objetivo de `foot_target_at_phase` supere ``safe_fraction ·
+    max_chain_length``.
+
+    Por qué hace falta (hallazgo documentado en el checkpoint del
+    2026-08-20 de CLAUDE.md): con `stride_amplitude_pct` fijo sobre el
+    alcance en línea recta (`reach`, no `max_chain_length`), algunas
+    patas piden objetivos por encima del ~87% de su longitud física
+    máxima real en ciertas fases — ahí CCD converge extremadamente
+    despacio por proximidad a la extensión completa de la cadena
+    (geometría casi degenerada: un triángulo pivote-efector-objetivo casi
+    plano no tiene una dirección de rotación bien definida que reduzca el
+    error rápido). Esta función recorta la amplitud SOLO cuando hace
+    falta, muestreando la fase igual que ``verify_never_below_ground``
+    (no hay una forma cerrada simple porque el punto más lejano de
+    ``chain_root_position`` a lo largo del ciclo depende de cómo se
+    combinan el offset horizontal y el vertical, que no son colineales en
+    general).
+
+    Si ``requested_amplitude_pct`` ya cumple la condición sin recortar,
+    se devuelve tal cual — las patas que ya convergían bien con la
+    amplitud pedida no deben cambiar de comportamiento (verificado en
+    `test_gait_cycle.py`: mismo orden de magnitud de iteraciones que
+    antes de este cambio para esas patas).
+
+    ``safe_fraction=0.87`` por defecto — calibrado empíricamente contra
+    LAS DOS patas conocidas, no solo la problemática:
+
+    - `chain_root=27` (cow, la que falla sin recorte): con
+      `safe_fraction` en 0.868-0.87 el recorte da amplitudes muy
+      similares (0.081-0.093) y `solve_ik_ccd` converge en las 30 fases
+      del ciclo con margen cómodo (máx. 324-325 de 500 iteraciones,
+      65% del presupuesto — ya no "pegado al límite"). Con 0.92 o 0.95
+      el recorte es casi nulo (amplitud final 0.2975-0.3) y las mismas 4
+      fases siguen sin converger ni con 500 iteraciones — no basta con
+      subir el `safe_fraction`, hay que quedarse cerca de la banda que
+      de verdad excluye las fases problemáticas.
+    - `chain_root=31` (cow, la que YA convergía bien sin recorte, 158
+      iteraciones): su distancia máxima real a lo largo del ciclo, con
+      la amplitud pedida (0.3) sin tocar, es **86.7%** de su longitud
+      máxima — un primer intento con `safe_fraction=0.85` (más bajo)
+      recortaba esta pata también (a amplitud 0.238), violando el
+      requisito de que las patas que ya iban bien no cambien de
+      comportamiento. 0.87 queda justo por encima de ese 86.7%, así que
+      `chain_root=31` sigue devolviendo la amplitud pedida sin modificar
+      (158 iteraciones, idénticas a antes de este cambio).
+
+    Nota honesta: el % de la longitud máxima alcanzado NO es un
+    predictor perfecto por sí solo de si CCD converge rápido — a modo de
+    ejemplo, `chain_root=31` llega al 86.7% y converge en 158
+    iteraciones, mientras que `chain_root=27` ya falla en fases con un
+    87.0% (la geometría concreta de cada cadena, qué huesos necesitan
+    doblarse y en qué dirección, importa además del porcentaje). Aun así,
+    recortar por este criterio relativo resuelve el caso conocido sin
+    tocar el que no lo necesitaba, que es el objetivo de esta tarea.
+
+    Búsqueda binaria sobre la amplitud (``num_search_iterations`` pasos,
+    cada uno evaluando ``num_phase_samples`` fases) — asume que la
+    distancia máxima a `chain_root_position` a lo largo del ciclo crece
+    con la amplitud (cierto por construcción: solo escala la magnitud del
+    componente horizontal, todo lo demás fijo), así que basta encontrar
+    el punto de corte, no hace falta una forma cerrada.
+
+    Caso límite: si NI SIQUIERA amplitud 0 cumple la condición (una pata
+    cuya `bind_foot_position` más la elevación del salto ya está por
+    encima de `safe_fraction · max_chain_length` sin ningún movimiento
+    horizontal), la búsqueda binaria devuelve 0.0 igualmente — es lo
+    mejor que se puede hacer sin amplitud negativa. No aparece en los 3
+    samples (la pata más cercana al límite, `chain_root=27`, todavía deja
+    margen para amplitud 0.09 con `safe_fraction=0.87`), pero si ocurriera
+    en un futuro modelo sería la señal de que este `chain_root` concreto
+    ya está casi en extensión completa incluso en bind pose — haría falta
+    revisar la propia clasificación de la pata o sus límites articulares,
+    no este recorte.
+    """
+    chain_root_position = np.asarray(chain_root_position, dtype=np.float64)
+    safe_limit = safe_fraction * max_chain_length
+
+    def worst_case_distance(amplitude_pct: float) -> float:
+        worst = 0.0
+        for i in range(num_phase_samples):
+            phase = i / num_phase_samples
+            target = foot_target_at_phase(
+                bind_foot_position,
+                chain_root_position,
+                stride_direction,
+                phase,
+                stride_amplitude_pct=amplitude_pct,
+                lift_height_pct=lift_height_pct,
+            )
+            distance = float(np.linalg.norm(target - chain_root_position))
+            worst = max(worst, distance)
+        return worst
+
+    if worst_case_distance(requested_amplitude_pct) <= safe_limit:
+        return requested_amplitude_pct
+
+    low, high = 0.0, requested_amplitude_pct
+    for _ in range(num_search_iterations):
+        mid = (low + high) / 2.0
+        if worst_case_distance(mid) <= safe_limit:
+            low = mid
+        else:
+            high = mid
+    return low
