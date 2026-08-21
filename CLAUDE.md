@@ -47,9 +47,11 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
   trayectoria de ciclo para una sola pata + dirección de zancada
   automática + reparto de fase entre patas + pose de marcha con varias
-  patas a la vez hechas y verificadas; falta resolver el signo de
-  `stride_direction`, límites articulares y la pose de "asombro" antes
-  de poder cerrarlo.
+  patas a la vez + ejes de bisagra por articulación hechas y
+  verificadas; falta APLICAR el límite de ángulo de verdad dentro de
+  `solve_ik_ccd` (esta tarea solo calculó los ejes, no los usa
+  todavía), resolver el signo de `stride_direction`, y la pose de
+  "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -1241,3 +1243,92 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   Todavía pendiente del Módulo 3: resolución del signo de
   `stride_direction` (qué extremo es "adelante"), límites articulares
   anatómicos, y la pose de "asombro".
+
+- **[Módulo 3 — ejes de bisagra por articulación] 2026-08-21** — Primer
+  cimiento de límites articulares: `joint_limits.compute_hinge_axes`
+  (nuevo módulo `backend/app/joint_limits.py`, y nuevo archivo de test
+  `backend/tests/test_joint_limits.py` — pieza distinta del proyecto).
+  Para cada hueso de una `LimbChain`, calcula su eje de bisagra NATURAL
+  en bind pose (el eje alrededor del cual esa articulación CONCRETA se
+  dobla, no uno global para toda la pata). Todavía NO aplica ningún
+  límite de ángulo ni toca `solve_ik_ccd` — eso depende de tener
+  primero ejes verificados que tengan sentido.
+
+  **Dos diseños descartados con datos reales, documentados en el
+  docstring para no reintentarlos**:
+  1. Un `side_axis` único por pata (análogo al de
+     `assign_limb_phase_offsets`): la alineación con el eje local real
+     de cada articulación varía entre 10° y 89° en biped — inservible.
+  2. Un plano de mejor ajuste (SVD) sobre TODOS los nodos de la
+     cadena: funciona en cow (patas cortas, casi planas) pero falla en
+     biped, cuya cadena incluye falanges de un dedo del pie que no
+     bisagran en el mismo plano que la rodilla.
+
+  **Diseño que sí funciona**: por cada hueso "bone_P_C", eje =
+  `normalizado(cross(incoming, outgoing))` donde `incoming = pos[P] -
+  pos[GP]` (del abuelo al padre) y `outgoing = pos[C] - pos[P]` (del
+  padre al hijo) — la normal al plano de flexión LOCAL de esa
+  articulación concreta en su postura de reposo.
+
+  **Caso 1 — exclusión a propósito (cadera/hombro pegada a la raíz)**:
+  si `GP = hierarchy[P]` es `None` (P es la propia raíz del esqueleto),
+  no hay "entrante" del que derivar nada — es la articulación más
+  proximal, anatómicamente más "bola" que "bisagra". Verificado sobre
+  los 3 modelos: excluye `bone_2_27` y `bone_2_3` en cow (las dos patas
+  delanteras cuelgan directamente de la raíz; las traseras NO, pivotan
+  en el nodo 4, un nivel más abajo) y `bone_13_17` en bat. La pata
+  `chain_root=15` de bat (un solo hueso, `bone_13_15`) queda con el
+  dict VACÍO — su único hueso cae en este caso, coherente con ser una
+  pata de un solo hueso sin ninguna bisagra propiamente dicha.
+
+  **Caso 2 — geometría casi degenerada, con umbral verificado
+  empíricamente**: si el ángulo entrante/saliente está fuera de
+  `[10°, 170°]` (`cross` numéricamente inestable ahí), el hueso se
+  marca "pendiente" y hereda el eje del vecino resuelto más cercano en
+  la misma cadena (buscando hacia ambos lados en `chain_bone_names`).
+  Con `degenerate_angle_threshold_deg=10.0` (el valor pedido),
+  recalculando los ángulos reales de biped se confirmó EXACTAMENTE lo
+  ya reportado: 3 huesos degenerados —
+  `bone_32_5` (8.27°, hereda de `bone_5_71`), `bone_192_240` (9.66°,
+  hereda de `bone_240_267`) y `bone_141_174` (3.72°, hereda de
+  `bone_174_274`) — los tres con eje heredado EXACTAMENTE igual (no
+  solo aproximado) al de su vecino, verificado en
+  `test_degenerate_joints_inherit_from_neighbor` re-calculando los
+  ángulos desde cero en el propio test, no hardcodeados de memoria.
+
+  **Verificación visual** (`backend/scripts/_plot_hinge_axes_debug.py`,
+  nuevo, matplotlib sin Blender): esqueleto en bind pose proyectado
+  sobre el plano de mayor variación de LAS PATAS (PCA restringido a los
+  nodos de las cadenas, no de todo el cuerpo — primera versión usaba
+  todo el esqueleto y en biped el plano salía dominado por el brazo
+  extendido en T-pose, irrelevante para las bisagras de las piernas;
+  corregido antes de dar la tarea por buena), con una flecha por
+  pivote a lo largo de su eje. Comprobado a ojo sobre los 3 modelos
+  (`samples/_debug/{modelo}_hinge_axes.png`): en cow, las flechas de
+  cada pata muestran variación razonable pero ninguna gira en una
+  dirección descabellada respecto a sus vecinas ni respecto al eje
+  lateral aproximado del cuerpo; en biped, la zona de dedos del pie
+  (muy densificada) muestra bastante ruido visual por la cantidad de
+  huesos superpuestos, pero las articulaciones grandes (cadera, rodilla,
+  tobillo) se ven razonables; en bat, `chain_root=17` muestra su único
+  eje resuelto con sentido, `chain_root=15` no muestra ninguna flecha
+  (dict vacío, esperado).
+
+  **`backend/tests/test_joint_limits.py`** (9 tests, todos en verde):
+  3 huesos de cow bien definidos (identificados inspeccionando los
+  ángulos reales antes de escribir el test, todos >20°) verificados
+  contra una fórmula directa recalculada en el propio test; exclusión
+  del pivote cadera/hombro confirmada en cow y bat; herencia de los 3
+  huesos degenerados de biped confirmada (re-detectados en el propio
+  test, no hardcodeados) con eje EXACTAMENTE igual al de un vecino; y
+  norma unitaria de todos los ejes devueltos en los 3 modelos.
+
+  **Verificación:** `pytest backend/tests/` completo → **86 passed**, 0
+  failed (77 de antes + 9 nuevos).
+
+  Ejes de bisagra calculados y verificados. Todavía pendiente del
+  Módulo 3 (y de este sub-tema de límites articulares en concreto):
+  APLICAR un límite de ángulo de verdad alrededor de estos ejes dentro
+  de `solve_ik_ccd` (esta tarea solo calcula los ejes, no restringe
+  ninguna rotación todavía) — más resolución del signo de
+  `stride_direction` y la pose de "asombro".
