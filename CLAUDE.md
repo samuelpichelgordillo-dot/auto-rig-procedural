@@ -42,19 +42,26 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 3 — Animación procedural básica (en curso)
-- **Estado:** Módulos 0, 1 y 2 completados y verificados. Módulo 3:
-  clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
-  trayectoria de ciclo para una sola pata + dirección de zancada
-  automática + reparto de fase entre patas + pose de marcha con varias
-  patas a la vez + ejes de bisagra por articulación (mundo bind pose y
-  marco local del padre) + restricción de EJE de rotación dentro de
-  `solve_ik_ccd` + límite de ÁNGULO (rango de flexión/extensión) dentro
-  de cada bisagra hechas y verificadas. El signo de `stride_direction`
-  queda sin resolver como límite ACEPTADO Y PERMANENTE (investigado y
-  documentado, no pendiente de hacer — ver checkpoint 2026-08-21
-  "signo de stride_direction, decisión de no perseguirlo"). Falta solo
-  la pose de "asombro" antes de poder cerrar el módulo.
+- **Módulo actual:** 4 — Micro-movimientos (siguiente, aún sin empezar)
+- **Estado:** Módulos 0, 1, 2 y 3 completados y verificados. Módulo 3
+  (animación procedural básica) **CERRADO** 2026-08-21: clasificación de
+  patas de apoyo (`limb_classification.classify_support_limbs`) + IK CCD
+  de una sola pata (`ik_solver.solve_ik_ccd`) + trayectoria de ciclo por
+  pata (`gait_cycle.foot_target_at_phase` + amplitud segura) + dirección
+  de zancada automática (`detect_stride_direction`) + reparto de fase
+  entre patas (`assign_limb_phase_offsets`) + pose de marcha con varias
+  patas a la vez (`solve_gait_cycle_pose`) + límites articulares por
+  bisagra, eje y ángulo combinados (`joint_limits.compute_hinge_axes` +
+  `hinge_axes_in_local_frame`, aplicados dentro de `solve_ik_ccd` vía
+  `hinge_axes_local`/`hinge_max_angle_deg`) + pose de "asombro"
+  (`surprise_pose_phase_offsets`, todas las patas en fase). El signo de
+  `stride_direction` queda sin resolver como límite ACEPTADO Y
+  PERMANENTE de este enfoque geométrico (investigado y documentado, no
+  pendiente — ver checkpoint 2026-08-21 "signo de stride_direction,
+  decisión de no perseguirlo"), no bloquea el cierre del módulo porque
+  ninguna pieza construida depende de resolverlo. Empieza Módulo 4:
+  micro-movimientos (respiración, parpadeo, ruido de baja frecuencia en
+  dedos/cola/orejas) — sin empezar todavía, espera instrucción atómica.
 
 ## Roadmap por módulos
 
@@ -93,9 +100,22 @@ pasa sin errores. No se avanza al siguiente módulo antes de eso.
 - Objetivo: ciclos de marcha/carrera paramétricos (senoidales con desfase de
   fase por extremidad), IK simple (CCD/FABRIK) para contacto con el suelo,
   pose de "asombro" como ejemplo de pose dirigida.
-- Verificación: `pytest backend/tests/test_locomotion.py` sobre los 3 modelos
-  — el ciclo de marcha es periódico y estable, los pies/patas no atraviesan
-  el plano del suelo más de un umbral tolerado.
+- Verificación: **no existe `backend/tests/test_locomotion.py`** — el módulo
+  terminó organizado en 4 archivos de test más pequeños y temáticos en vez
+  de uno solo por módulo (decisión tomada sobre la marcha, nunca revertida
+  porque no había ganancia real en mover tests ya verificados; ver
+  checkpoint de cierre del Módulo 3 en el historial): `test_limb_classification.py`
+  (clasificación de patas de apoyo), `test_ik_solver.py` (IK CCD, incluida
+  la restricción de eje+ángulo de bisagra), `test_joint_limits.py` (ejes de
+  bisagra por articulación), `test_gait_cycle.py` (trayectoria de ciclo,
+  dirección de zancada, reparto de fase, pose de marcha multi-pata y pose
+  de "asombro"). El criterio de éxito sigue siendo el mismo: `pytest
+  backend/tests/` completo sobre los 3 modelos — el ciclo de marcha es
+  periódico (`verify_phase_periodicity`) y los pies/patas no atraviesan el
+  plano del suelo (`verify_never_below_ground`, cubre el objetivo pedido a
+  `foot_target_at_phase`; la posición REAL resuelta por IK se confirma
+  aparte, dentro de tolerancia 1e-4, en los tests de convergencia de
+  `test_ik_solver.py`/`test_gait_cycle.py`).
 
 ### Módulo 4 — Micro-movimientos
 - Objetivo: respiración, parpadeo, ruido de baja frecuencia en dedos/cola/orejas.
@@ -1818,3 +1838,127 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   `.py`, solo lectura/inspección con scripts temporales fuera del
   repo). `pytest backend/tests/` sigue en el mismo estado que el
   checkpoint anterior: **111 passed**, 0 failed.
+
+- **[Módulo 3 — pose de "asombro" y CIERRE del Módulo 3] 2026-08-21** —
+  Última pieza pendiente del módulo: `gait_cycle.surprise_pose_phase_offsets(limbs)`,
+  una función pequeña (una línea de cuerpo: `{limb.chain_root: 0.0 for
+  limb in limbs}`) que reutiliza el 100% de `solve_gait_cycle_pose` ya
+  verificado — el ÚNICO cambio respecto a la marcha normal es el
+  `phase_offsets` que se le pasa.
+
+  **Por qué "todas las patas en fase" da una pose de sobresalto**: en
+  una marcha real en equilibrio (o en `assign_limb_phase_offsets`), el
+  reparto alterna/diagonaliza precisamente para que nunca todas las
+  patas estén en el aire a la vez — un cuerpo necesita siempre alguna
+  pata de apoyo. Poner TODAS las patas en la MISMA fase rompe esa
+  restricción a propósito: en `global_phase=0.25` todas se extienden
+  hacia arriba/adelante simultáneamente, una postura físicamente
+  imposible de sostener en una marcha real en equilibrio, pero que se
+  lee como un sobresalto o salto congelado en el aire — no como "otro
+  instante cualquiera de caminar". Generaliza a cualquier nº de patas
+  sin ninguna heurística nueva (a diferencia de
+  `assign_limb_phase_offsets`, que necesita ramificar explícitamente
+  entre 2 y 4 patas con `NotImplementedError` para el resto) y no
+  depende del signo sin resolver de `stride_direction` (todas las patas
+  se mueven hacia el MISMO lado relativo a la vez, da igual cuál extremo
+  sea "adelante" de verdad).
+
+  **`global_phase=0.25` confirmado como pico de elevación en los 3
+  modelos, no asumido**: `max(0, sin(2π·phase))` de `foot_target_at_phase`
+  tiene su único máximo exacto en `phase=0.25` — una propiedad de la
+  fórmula, no del modelo — pero se confirmó igualmente resolviendo la
+  pose de asombro completa en 40 fases para los 3 modelos antes de
+  escribir el test: el pico de altura del pie de CADA pata cae
+  exactamente en `phase=0.25` (`bat chain_root=15`, la pata de un solo
+  hueso con `reach=0` ya documentada en checkpoints anteriores, es la
+  única excepción — se queda plana en TODAS las fases, esperado).
+
+  **`backend/tests/test_gait_cycle.py`** ampliado con 2 tests nuevos (45
+  en total, antes 39): `test_surprise_pose_all_legs_converge`
+  (parametrizado por los 3 modelos, mismo patrón que
+  `test_all_limbs_converge_across_full_cycle` pero con
+  `surprise_pose_phase_offsets` — 0 fallos en las 8 patas) y
+  `test_surprise_pose_offsets_are_all_zero` (trivial pero explícito:
+  confirma 0.0 para cada `chain_root`, los 3 modelos).
+
+  **Verificación visual** (`backend/scripts/_plot_surprise_pose_debug.py`,
+  nuevo — mismo patrón de estilo que los scripts de depuración
+  anteriores, silueta lateral completa de cada pata): compara, en la
+  MISMA `global_phase=0.25`, la pose de asombro (sólido) contra la
+  marcha normal alternada/diagonal (discontinuo). Comprobado a ojo sobre
+  los 3 modelos (`samples/_debug/{modelo}_surprise_pose.png`):
+
+  - **cow**: el más claro de los 3 — en la marcha normal (discontinuo)
+    dos patas están arriba (~Y 3.0-3.6, grupo de fase que coincide con
+    asombro en esta fase) y dos abajo (~Y 0.3-0.5, el otro grupo
+    diagonal, en stance); en la pose de asombro (sólido) las 4 patas
+    quedan arriba, sin ninguna cerca del suelo — el contraste "todas
+    arriba a la vez" contra "dos arriba, dos abajo" de la marcha normal
+    es inmediatamente reconocible como sobresalto.
+  - **biped**: `chain_root=5` (offset 0.0 en AMBOS repartos, por ser la
+    pata que `assign_limb_phase_offsets` ordena primera — sus dos líneas
+    coinciden, esperado) sirve de referencia; `chain_root=88` muestra la
+    diferencia real: discontinuo cerca de Y=0 (stance, pie apoyado) vs
+    sólido subiendo hasta el pico (~Y 0.92) — visible con claridad.
+  - **bat**: el contraste MENOS dramático de los 3 (medido, no solo
+    impresión visual): altura del pie de `chain_root=17` en
+    `global_phase=0.25` es 0.564 con offsets normales (fase local 0.75,
+    stance) vs 0.618 con offsets de asombro (fase local 0.25, pico) —
+    una diferencia de solo 0.055 sobre una longitud de pata de ~1.15,
+    frente a la diferencia de ~2.5-3.0 de cow. Explicable por la propia
+    geometría/proporciones de esta pata concreta de bat
+    (`lift_height_pct · alcance` da un desplazamiento vertical modesto
+    en términos absolutos aquí), no un bug — `chain_root=15` (pata de un
+    solo hueso, `reach≈0`) se mantiene plana en ambos casos, como se
+    esperaba. El efecto sigue estando en la dirección correcta (más alto
+    en asombro que en marcha normal en esa fase), solo que menos
+    pronunciado que en cow/biped.
+
+  **Reconciliación del roadmap (Módulo 3, sección "Roadmap por
+  módulos")**: el criterio de verificación mencionaba
+  `pytest backend/tests/test_locomotion.py`, un archivo que nunca
+  existió — el módulo terminó organizado en 4 archivos temáticos más
+  pequeños en vez de uno solo (`test_limb_classification.py`,
+  `test_ik_solver.py`, `test_joint_limits.py`, `test_gait_cycle.py`),
+  decisión tomada sobre la marcha en checkpoints anteriores y nunca
+  revertida porque no había ninguna ganancia real en reorganizar tests
+  ya verificados solo para que el nombre coincidiera con el roadmap
+  original. Se actualizó el TEXTO del roadmap para reflejar la
+  organización real, sin tocar ni renombrar ningún test (mucho más
+  arriesgado sin beneficio).
+
+  **Confirmación explícita del criterio "los pies/patas no atraviesan
+  el plano del suelo"** (pedido antes de cerrar el módulo, no asumido):
+  cubierto por `gait_cycle.verify_never_below_ground` (auto-chequeo
+  obligatorio sobre `foot_target_at_phase`, muestrea 1000 fases y
+  confirma que la Y del objetivo nunca baja de la Y de bind pose del
+  pie — ejecutado como test, `test_never_below_ground`, para los 3
+  modelos) a nivel del OBJETIVO que se le pide al IK. La posición REAL
+  resuelta por `solve_ik_ccd` (que podría en teoría no coincidir
+  exactamente con el objetivo) se confirma aparte, dentro de
+  `_CONVERGENCE_TOLERANCE`/`tolerance` (1e-4), en los tests de
+  convergencia de `test_ik_solver.py` y `test_gait_cycle.py` — entre
+  ambos, el criterio queda cubierto de extremo a extremo (objetivo
+  nunca bajo el suelo + posición real siempre a ≤1e-4 del objetivo),
+  no solo a nivel de la fórmula que genera el objetivo.
+
+  **Verificación:** `pytest backend/tests/` completo → **117 passed**,
+  0 failed (111 de antes + 6 nuevos: `test_surprise_pose_all_legs_converge`
+  y `test_surprise_pose_offsets_are_all_zero`, cada uno parametrizado
+  por los 3 modelos).
+
+  **MÓDULO 3 — CIERRE FORMAL.** Compuesto por: clasificación de patas de
+  apoyo, IK CCD por pata, trayectoria de ciclo con amplitud segura,
+  dirección de zancada automática, reparto de fase entre patas, pose de
+  marcha con varias patas a la vez, límites articulares (eje + ángulo de
+  cada bisagra) dentro de `solve_ik_ccd`, y ahora la pose de "asombro".
+  El signo de `stride_direction` queda como límite aceptado y permanente
+  del enfoque geométrico (no pendiente — checkpoint 2026-08-21 dedicado).
+  Sin comando de verificación único (`test_locomotion.py` nunca existió,
+  ver reconciliación de roadmap arriba); el cierre se apoya en
+  `pytest backend/tests/` completo (117 passed) repartido en los 4
+  archivos temáticos ya mencionados.
+
+  Empieza Módulo 4 — micro-movimientos: respiración, parpadeo, ruido de
+  baja frecuencia en dedos/cola/orejas. Sin empezar todavía, espera
+  instrucción atómica del director técnico-creativo.

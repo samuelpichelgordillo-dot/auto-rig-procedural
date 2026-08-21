@@ -24,6 +24,7 @@ from backend.app.gait_cycle import (
     max_chain_bone_length,
     safe_stride_amplitude_pct,
     solve_gait_cycle_pose,
+    surprise_pose_phase_offsets,
     verify_never_below_ground,
     verify_phase_periodicity,
 )
@@ -511,3 +512,61 @@ def test_phase_zero_offset_limbs_at_forward_extreme(skeleton_and_skin_by_model):
             f"{offsets[limb.chain_root]}): el pie resuelto en el dict combinado "
             f"está a {error} de su propio objetivo de fase local {local_phase}"
         )
+
+
+# --- pose de "asombro" (surprise_pose_phase_offsets) ---
+#
+# Mismo `solve_gait_cycle_pose` de siempre, pero con TODAS las patas en
+# la MISMA fase (`phase_offset=0.0` para todas, en vez del reparto
+# alternado/diagonal de `assign_limb_phase_offsets`) — sincronía
+# imposible en una marcha real en equilibrio, que se lee como un
+# sobresalto/salto congelado. `global_phase=0.25`: el pico de elevación
+# es una propiedad exacta de `foot_target_at_phase` (`max(0, sin(2π·phase))`
+# alcanza su único máximo en `phase=0.25`, para cualquier pata de
+# cualquier modelo), confirmado empíricamente antes de escribir estos
+# tests resolviendo la pose completa en 40 fases para los 3 modelos: el
+# pico de altura de cada pata (salvo `bat chain_root=15`, la pata de un
+# solo hueso con `reach=0` ya documentada — se queda plana en todas las
+# fases) cae exactamente en `phase=0.25`.
+
+_SURPRISE_GLOBAL_PHASE = 0.25
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_surprise_pose_all_legs_converge(skeleton_and_skin_by_model, model):
+    """Mismo patrón que `test_all_limbs_converge_across_full_cycle`, pero
+    con `surprise_pose_phase_offsets` (todas las patas en fase) en vez
+    del reparto alternado/diagonal — confirma que la pose de asombro en
+    sí converge, para las 8 patas de los 3 modelos, en el
+    `global_phase` que da la extensión más dramática."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+    offsets = surprise_pose_phase_offsets(limbs)
+    amplitudes = compute_safe_amplitudes(limbs, tree, hierarchy, direction)
+
+    _, results = solve_gait_cycle_pose(
+        skin_data, limbs, tree, hierarchy, _SURPRISE_GLOBAL_PHASE, direction, offsets, amplitudes
+    )
+
+    failures = [
+        (chain_root, result.final_error, result.iterations_used)
+        for chain_root, result in results.items()
+        if not result.converged
+    ]
+    assert not failures, f"{model}: patas que no convergieron en la pose de asombro: {failures}"
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_surprise_pose_offsets_are_all_zero(skeleton_and_skin_by_model, model):
+    """Trivial pero explícito: `surprise_pose_phase_offsets` debe dar
+    0.0 para CADA pata, para los 3 modelos — es la propiedad que
+    distingue esta pose del reparto alternado de
+    `assign_limb_phase_offsets`."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+    offsets = surprise_pose_phase_offsets(limbs)
+
+    assert set(offsets.keys()) == set(limbs_by_root.keys())
+    for chain_root, offset in offsets.items():
+        assert offset == 0.0, f"{model} chain_root={chain_root}: offset {offset} != 0.0"

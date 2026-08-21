@@ -522,6 +522,46 @@ def assign_limb_phase_offsets(
     )
 
 
+def surprise_pose_phase_offsets(limbs: list[LimbChain]) -> dict[int, float]:
+    """`phase_offset = 0.0` para TODAS las patas — el reparto (deliberadamente
+    trivial) que usa la pose de "asombro" en vez de
+    `assign_limb_phase_offsets`.
+
+    **Por qué "todas en fase" da una pose de sobresalto y no "otro
+    instante cualquiera de caminar"**: en una marcha real (o en
+    `assign_limb_phase_offsets`), el reparto alterna/diagonaliza
+    precisamente para que NUNCA todas las patas estén en swing (en el
+    aire, alejándose del suelo) al mismo tiempo — un cuerpo necesita
+    siempre alguna pata de apoyo para no caerse. Poner TODAS las patas
+    en la MISMA fase rompe esa restricción a propósito: en
+    `global_phase=0.25` (el pico de elevación, ver `foot_target_at_phase`
+    — `max(0, sin(2π·phase))` alcanza su único máximo exacto en
+    `phase=0.25` para CUALQUIER pata, es una propiedad de la fórmula, no
+    algo que dependa del modelo) todas las patas se extienden hacia
+    arriba/adelante A LA VEZ, una postura físicamente imposible de
+    sostener en equilibrio durante una marcha real — pero es exactamente
+    la lectura visual de un sobresalto o un salto congelado en el aire
+    (todas las extremidades reaccionando al mismo tiempo), no un instante
+    de locomoción normal.
+
+    **Por qué esto generaliza sin heurísticas nuevas**: a diferencia de
+    `assign_limb_phase_offsets` (que necesita ramificar explícitamente
+    entre 2 y 4 patas, con un `NotImplementedError` para cualquier otro
+    número), "todas a 0.0" es trivialmente válido para CUALQUIER nº de
+    patas — no hay pares que formar ni ejes de "lado" que calcular. No
+    depende tampoco del signo sin resolver de `stride_direction` (ver
+    `detect_stride_direction`): todas las patas se mueven hacia el MISMO
+    lado relativo del eje detectado a la vez, así que da igual cuál
+    extremo sea "adelante" de verdad para que la pose se lea como
+    sobresalto.
+
+    Devuelve `chain_root -> 0.0` para cada pata de `limbs` — misma forma
+    de retorno que `assign_limb_phase_offsets`, intercambiable como
+    argumento `phase_offsets` de `solve_gait_cycle_pose`.
+    """
+    return {limb.chain_root: 0.0 for limb in limbs}
+
+
 def compute_safe_amplitudes(
     limbs: list[LimbChain],
     tree: nx.Graph,
