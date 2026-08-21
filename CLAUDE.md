@@ -50,8 +50,11 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   patas a la vez + ejes de bisagra por articulación (mundo bind pose y
   marco local del padre) + restricción de EJE de rotación dentro de
   `solve_ik_ccd` + límite de ÁNGULO (rango de flexión/extensión) dentro
-  de cada bisagra hechas y verificadas; falta resolver el signo de
-  `stride_direction`, y la pose de "asombro" antes de poder cerrarlo.
+  de cada bisagra hechas y verificadas. El signo de `stride_direction`
+  queda sin resolver como límite ACEPTADO Y PERMANENTE (investigado y
+  documentado, no pendiente de hacer — ver checkpoint 2026-08-21
+  "signo de stride_direction, decisión de no perseguirlo"). Falta solo
+  la pose de "asombro" antes de poder cerrar el módulo.
 
 ## Roadmap por módulos
 
@@ -1734,3 +1737,84 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   queda cerrado. Todavía pendiente del Módulo 3: resolución del signo
   de `stride_direction` (qué extremo es "adelante"), y la pose de
   "asombro".
+
+- **[Módulo 3 — signo de `stride_direction`, decisión de no
+  perseguirlo] 2026-08-21** — Tarea de SOLO DOCUMENTACIÓN, sin cambios
+  de código: investigación de si merece la pena un clasificador
+  columna-vs-extremidad para resolver el signo de `stride_direction`
+  (qué extremo de la línea detectada por `detect_stride_direction` es
+  "adelante", hacia la cabeza, y cuál "atrás", hacia la cola) — decisión
+  de NO perseguirlo, documentada aquí para que no se repita la
+  investigación en el futuro sin releer esto primero.
+
+  **Hallazgo 1 (verificado con datos reales, los 3 modelos): la
+  información SÍ existe en cuadrúpedos/alados, pero NO en biped por un
+  límite duro de la pose, no del algoritmo.** Se probó un heurístico
+  simple: la "columna" (nodo no-pata topológicamente más lejano de la
+  raíz del esqueleto, excluyendo cualquier nodo perteneciente a una
+  `LimbChain` — es decir, cabeza/cuello/cola en cow y bat, y
+  cabeza/cuello en biped) comparada contra `stride_direction` vía
+  coseno del vector raíz→columna:
+
+  | modelo | coseno(columna, stride_direction) | interpretación |
+  |---|---|---|
+  | cow | -0.975 | casi perfectamente alineado (antiparalelo) |
+  | bat | -0.909 | casi perfectamente alineado (antiparalelo) |
+  | biped | -0.081 | prácticamente SIN relación |
+
+  Para biped se comprobó también contra el eje VERTICAL (Y): coseno
+  **-0.991** — la columna de un biped de pie apunta hacia ARRIBA
+  (cabeza sobre las caderas), no hacia adelante ni atrás en ningún
+  sentido horizontal. Esto es un límite DURO de la información
+  disponible en una pose estática de pie (T-pose o similar): ningún
+  clasificador, por sofisticado que sea, puede extraer de la geometría
+  del esqueleto en bind pose una señal horizontal de "adelante" que
+  simplemente no está presente en el dato de entrada para un biped
+  erguido — no es una limitación de heurístico, es una limitación de la
+  pose misma.
+
+  **Hallazgo 2 (verificado con datos reales, bat): incluso en el
+  subconjunto donde la señal SÍ existe, el heurístico de ramificación es
+  frágil ante proporciones distintas.** El diseño de "nodo no-pata más
+  lejano de la raíz" depende implícitamente de que la columna/cola sea
+  la rama topológicamente más larga entre los nodos no clasificados como
+  pata. En bat, las alas (que `classify_support_limbs` NO clasifica
+  como patas de apoyo — están demasiado altas en la T-pose, ver
+  checkpoint de clasificación de patas — y quedan mezcladas con la
+  columna en el conjunto "no-pata") están a solo **1 salto topológico
+  menos** que el verdadero extremo columna/cola. El heurístico funcionó
+  en este caso concreto (coseno -0.909, arriba) pero por poco margen: un
+  modelo con alas más largas o una cola más corta, en proporción,
+  invertiría fácilmente cuál rama gana como "la más lejana" — el diseño
+  no es robusto a variación de proporciones entre criaturas, solo
+  funciona porque en bat concretamente la cola gana por un margen
+  topológico pequeño.
+
+  **Decisión: no se persigue.** Construir un clasificador
+  columna-vs-extremidad sería una pieza nueva del tamaño de
+  `limb_classification.classify_support_limbs` (nuevo módulo, nuevos
+  tests, nueva inspección visual) para un heurístico que, en el mejor
+  caso, solo cubre cuerpos horizontales tipo cuadrúpedo/alado, de forma
+  frágil ante proporciones (Hallazgo 2) — y que en el caso de biped
+  (un tercio de los samples disponibles) no puede funcionar NUNCA, sin
+  importar cuánto se refine el heurístico, porque la información
+  necesaria no existe en la pose de entrada (Hallazgo 1). El coste no
+  se justifica frente al beneficio.
+
+  El signo de `stride_direction` queda sin resolver como **límite
+  ACEPTADO Y PERMANENTE de este enfoque geométrico**, no como tarea
+  pendiente de una fase posterior — no debe reaparecer en un futuro
+  "Estado actual" como pendiente del Módulo 3. Si en algún momento
+  posterior hiciera falta de verdad resolver el signo (p. ej. al añadir
+  traslación de la raíz por el mundo en un módulo futuro, donde la
+  dirección de avance real del personaje sí importa), la vía correcta
+  probablemente sea una señal DISTINTA a la geometría del esqueleto en
+  bind pose — un override manual del usuario (p. ej. "esta dirección es
+  adelante"), no un heurístico geométrico más elaborado sobre el mismo
+  dato de entrada que ya ha demostrado no contener la información
+  necesaria para biped.
+
+  Sin cambios de código en esta tarea (ninguna investigación tocó
+  `.py`, solo lectura/inspección con scripts temporales fuera del
+  repo). `pytest backend/tests/` sigue en el mismo estado que el
+  checkpoint anterior: **111 passed**, 0 failed.
