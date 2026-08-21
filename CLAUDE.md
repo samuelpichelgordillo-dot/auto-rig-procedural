@@ -1014,3 +1014,74 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   pendiente del Módulo 3: coordinación de varias patas moviéndose a la
   vez, desfase de fase entre ellas, dirección de zancada automática y
   límites articulares.
+
+- **[Módulo 3 — detección automática de dirección de zancada] 2026-08-21**
+  — `detect_stride_direction(limbs, tree)` en `gait_cycle.py`: hasta
+  ahora `stride_direction` se pasaba a mano en todos los tests. Dos
+  casos según el nº de patas (usa `chain_root_position` de cada pata, no
+  `foot_leaf` — más estable, no depende de la pose concreta del pie):
+
+  - **2 patas** (biped Y bat en estos samples — no solo biped; bat
+    también tiene exactamente 2, ver nota más abajo): dirección
+    horizontal perpendicular a la línea entre las dos
+    `chain_root_position`, proyectada al plano X-Z.
+  - **3+ patas** (cow, único caso con ≥3 en estos samples): PCA sobre
+    (X,Z) de TODOS los `chain_root_position` — el eje de mayor varianza.
+    Con solo 2 patas esto degeneraría al eje de la propia línea que las
+    une (la dirección EQUIVOCADA, a lo largo en vez de perpendicular), de
+    ahí el caso especial de arriba.
+
+  **Corrección respecto al enunciado de la tarea**: se pedía verificar
+  "cow/bat (≥3 patas)" asumiendo que bat tiene 3 o más — no es así,
+  `classify_support_limbs` da exactamente 2 patas para bat (las dos
+  traseras; alas excluidas, ver Módulo 3 — clasificación de patas). Bat
+  usa por tanto la rama de 2 patas (perpendicular a la línea), igual que
+  biped, no la rama PCA. Verificado igualmente para los 3 modelos.
+
+  **Signo NO resuelto — limitación deliberada, documentada en el
+  docstring**: no hace falta saber qué extremo es "adelante" todavía,
+  porque `foot_target_at_phase` es simétrico respecto al signo de
+  `stride_direction` (invertirlo solo desplaza la fase medio periodo,
+  no cambia la forma de la trayectoria ni si converge). Resolver el
+  signo necesita saber dónde está la cabeza/cola, no solo dónde están
+  las patas — tarea de coordinación multi-pata, después.
+
+  **Verificación visual** (`backend/scripts/_plot_stride_direction_debug.py`,
+  nuevo, matplotlib sin Blender): vista cenital (X-Z) de las 3 patas +
+  flecha de dirección detectada desde el centroide de las
+  `chain_root_position`, con ventana de vista dimensionada por percentil
+  (no min/max, para no dejar que unos pocos puntos extremos —dedos de
+  una mano totalmente extendida en T-pose, p. ej.— dominen la escala).
+  Comprobado a ojo sobre los 3 modelos (`samples/_debug/{modelo}_stride_direction.png`):
+
+  - cow: flecha a lo largo del eje delantero-trasero del cuerpo (hacia
+    las patas delanteras, cerca de cabeza/pecho) ✓.
+  - bat: flecha hacia el racimo de nodos de cabeza/orejas/nariz,
+    perpendicular al eje de las alas (que se extienden en diagonal, no a
+    lo largo de este eje) ✓.
+  - biped: flecha perpendicular a la línea entre las dos caderas ✓.
+
+  Ningún eje salió equivocado (solo el signo es arbitrario, como se
+  esperaba) — no hizo falta ningún fix de bug de orientación, solo dos
+  iteraciones de ajuste de escala de la propia ventana del render (ver
+  historial de commits del script) para que la flecha fuera visible con
+  suficiente contexto corporal en los 3 modelos.
+
+  **`backend/tests/test_gait_cycle.py`** ampliado con 6 tests nuevos
+  (30 en total, antes 24): horizontalidad exacta para los 3 modelos
+  (`test_stride_direction_is_horizontal`), y un chequeo cruzado contra
+  un recálculo INDEPENDIENTE hecho desde cero en el propio test
+  (`_independent_stride_direction` — PCA vía SVD en vez de autovalores
+  de covarianza para el caso de cow, mismo cálculo pero camino de código
+  distinto; no un vector esperado escrito a mano), comparando el ángulo
+  entre ambos vectores tratando signo positivo y negativo como
+  equivalentes (<1° de diferencia exigido) — para los 3 modelos, no
+  solo cow (`test_stride_direction_matches_independent_recomputation`).
+
+  **Verificación:** `pytest backend/tests/` completo → **68 passed**, 0
+  failed (62 de antes + 6 nuevos).
+
+  Detección automática de dirección de zancada cerrada y verificada.
+  Todavía pendiente del Módulo 3: asignación de fases entre patas,
+  patrón de marcha (trote, alternancia...), resolución del signo de
+  `stride_direction`, y límites articulares.

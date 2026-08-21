@@ -315,3 +315,84 @@ def safe_stride_amplitude_pct(
         else:
             high = mid
     return low
+
+
+def detect_stride_direction(limbs: list[LimbChain], tree: nx.Graph) -> np.ndarray:
+    """Determina automáticamente el eje de zancada del modelo a partir de
+    dónde están las patas — hasta ahora `stride_direction` se pasaba a
+    mano (ver checkpoints anteriores).
+
+    Dos casos, según cuántas patas hay (usa `chain_root_position` de cada
+    `LimbChain`, no `foot_leaf` — `chain_root` es el punto de la
+    cadera/hombro, más estable y menos sujeto a la pose concreta de la
+    punta del pie):
+
+    - **2 patas** (biped, bat en estos samples): el eje de zancada es la
+      dirección HORIZONTAL perpendicular a la línea entre las dos
+      `chain_root_position` (proyectada al plano XZ) — dos patas por sí
+      solas no dan información de "a lo largo de qué" salvo la línea que
+      las une, y la zancada va perpendicular a esa línea (adelante/atrás
+      respecto al eje cadera-cadera u hombro-hombro), no a lo largo de
+      ella.
+    - **3+ patas** (cow en estos samples): PCA sobre las posiciones
+      (X, Z) de TODOS los `chain_root_position` — el eje de mayor
+      varianza es, para un cuadrúpedo con patas repartidas a lo largo del
+      cuerpo, el eje longitudinal del propio cuerpo (de un extremo a
+      otro), que es la dirección natural de zancada. Con solo 2 patas
+      esto degenera (la "varianza máxima" sería trivialmente la propia
+      línea que las une, dando el eje EQUIVOCADO — a lo largo en vez de
+      perpendicular), de ahí el caso especial de arriba.
+
+    **Limitación conocida, deliberada, no resuelta en esta tarea**: el
+    SIGNO del vector devuelto es arbitrario (no se resuelve cuál extremo
+    es "adelante") — no hace falta resolverlo todavía porque
+    `foot_target_at_phase` es simétrico respecto al signo de
+    `stride_direction`: invertir el signo solo desplaza la fase del ciclo
+    medio periodo (`phase=0` pasaría a pedir lo que antes pedía
+    `phase=0.5`), no cambia la FORMA de la trayectoria ni si converge —
+    verificado explícitamente en `test_gait_cycle.py`. Resolver el signo
+    (qué extremo del eje detectado es de verdad "el morro"/"la cabeza")
+    es tarea de coordinación multi-pata (necesita saber dónde está la
+    cabeza/cola, no solo dónde están las patas).
+    """
+    if len(limbs) < 2:
+        raise ValueError(
+            f"Hacen falta al menos 2 patas para detectar una dirección de "
+            f"zancada, hay {len(limbs)}"
+        )
+
+    positions = np.array(
+        [tree.nodes[limb.chain_root]["pos"] for limb in limbs], dtype=np.float64
+    )
+
+    if len(limbs) == 2:
+        delta = positions[1] - positions[0]
+        delta_horizontal = np.array([delta[0], 0.0, delta[2]])
+        norm = np.linalg.norm(delta_horizontal)
+        if norm < 1e-9:
+            raise ValueError(
+                "Las dos patas están en la misma posición horizontal (X,Z) — "
+                "no se puede derivar una dirección perpendicular"
+            )
+        line_direction = delta_horizontal / norm
+        # Rotación de 90° en el plano XZ (Y fijo en 0): (x,z) -> (z,-x).
+        # El signo de esta rotación es arbitrario — ver docstring.
+        direction = np.array([line_direction[2], 0.0, -line_direction[0]])
+    else:
+        xz = positions[:, [0, 2]]
+        centered = xz - xz.mean(axis=0)
+        covariance = np.cov(centered, rowvar=False)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        principal_axis_xz = eigenvectors[:, int(np.argmax(eigenvalues))]
+        direction = np.array([principal_axis_xz[0], 0.0, principal_axis_xz[1]])
+
+    direction = direction / np.linalg.norm(direction)
+
+    if abs(direction[1]) > _STRIDE_DIRECTION_Y_TOLERANCE:
+        raise AssertionError(
+            f"detect_stride_direction produjo un vector no horizontal "
+            f"(componente Y = {direction[1]!r}) — bug en la construcción del "
+            "vector, no debería poder pasar por cómo se construye"
+        )
+
+    return direction

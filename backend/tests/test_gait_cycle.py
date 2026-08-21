@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from backend.app.gait_cycle import (
+    detect_stride_direction,
     foot_target_at_phase,
     max_chain_bone_length,
     safe_stride_amplitude_pct,
@@ -144,6 +145,76 @@ def test_zero_stride_direction_raises():
             stride_direction=np.array([0.0, 0.0, 0.0]),
             phase=0.1,
         )
+
+
+# --- detect_stride_direction ---
+#
+# Nota sobre el nº de patas por modelo (relevante para qué rama del
+# algoritmo se ejercita): cow tiene 4 patas (rama PCA, >=3), pero biped Y
+# bat tienen 2 cada uno (rama de la perpendicular a la línea entre las
+# dos `chain_root_position` — NO la rama PCA). Se comprueba la
+# horizontalidad en los 3 modelos, y el recálculo independiente
+# (siguiendo la rama que de verdad les corresponde a cada uno) en los 3
+# también — no solo en cow.
+
+
+def _independent_stride_direction(tree, limbs) -> np.ndarray:
+    """Recálculo independiente de `detect_stride_direction`, con numpy
+    directamente sobre las mismas posiciones, para usar como chequeo
+    cruzado en el test — NO reutiliza la función bajo prueba ni un vector
+    hardcodeado a mano."""
+    positions = np.array(
+        [tree.nodes[limb.chain_root]["pos"] for limb in limbs], dtype=np.float64
+    )
+    if len(limbs) == 2:
+        delta = positions[1] - positions[0]
+        delta_xz = np.array([delta[0], delta[2]])
+        delta_xz = delta_xz / np.linalg.norm(delta_xz)
+        # Perpendicular en 2D: (x,z) -> (z,-x) (mismo giro de 90° que la
+        # función bajo prueba; el signo no importa para este chequeo,
+        # ver comparación por valor absoluto del coseno más abajo).
+        perpendicular_xz = np.array([delta_xz[1], -delta_xz[0]])
+        return np.array([perpendicular_xz[0], 0.0, perpendicular_xz[1]])
+
+    # PCA vía SVD en vez de vía autovalores de la matriz de covarianza
+    # (que es como lo hace `detect_stride_direction`) — mismo resultado
+    # matemático, camino de código genuinamente distinto.
+    xz = positions[:, [0, 2]]
+    centered = xz - xz.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered)
+    principal_axis_xz = vt[0]
+    return np.array([principal_axis_xz[0], 0.0, principal_axis_xz[1]])
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_stride_direction_is_horizontal(skeleton_and_skin_by_model, model):
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+    direction = detect_stride_direction(limbs, tree)
+    assert abs(direction[1]) < 1e-9
+    assert np.linalg.norm(direction) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_stride_direction_matches_independent_recomputation(skeleton_and_skin_by_model, model):
+    """Compara `detect_stride_direction` contra un recálculo hecho desde
+    cero en el propio test (`_independent_stride_direction`), no contra
+    un vector esperado escrito a mano. El signo es arbitrario (ver
+    docstring de `detect_stride_direction`), así que se compara el
+    ÁNGULO entre ambos vectores tratando `v` y `-v` como equivalentes
+    (valor absoluto del coseno) — debe ser prácticamente 0°."""
+    tree, hierarchy, limbs_by_root, skin_data = skeleton_and_skin_by_model[model]
+    limbs = list(limbs_by_root.values())
+
+    detected = detect_stride_direction(limbs, tree)
+    independent = _independent_stride_direction(tree, limbs)
+
+    cosine = np.clip(abs(np.dot(detected, independent)), -1.0, 1.0)
+    angle_deg = np.degrees(np.arccos(cosine))
+    assert angle_deg < 1.0, (
+        f"{model}: ángulo entre detect_stride_direction y el recálculo "
+        f"independiente = {angle_deg:.3f}°, se esperaba <1°"
+    )
 
 
 # --- safe_stride_amplitude_pct ---
