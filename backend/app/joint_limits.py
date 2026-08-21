@@ -35,8 +35,9 @@ import math
 import networkx as nx
 import numpy as np
 
-from backend.app.ik_solver import chain_bone_names
+from backend.app.ik_solver import chain_bone_names, name_to_node_index
 from backend.app.limb_classification import LimbChain
+from backend.app.skinning_quality import SkinData, compute_global_matrices, trs_to_matrix
 
 DEFAULT_DEGENERATE_ANGLE_THRESHOLD_DEG = 10.0
 
@@ -154,3 +155,58 @@ def compute_hinge_axes(
         # (cadena entera degenerada — ver docstring, límite conocido).
 
     return result
+
+
+def hinge_axes_in_local_frame(
+    skin_data: SkinData,
+    hinge_axes: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Convierte cada eje de `compute_hinge_axes` (fijado en el
+    espacio-mundo de la BIND POSE) al marco LOCAL de su hueso padre en
+    bind pose. Mismas claves que `hinge_axes` de entrada, ninguna se
+    pierde ni se añade.
+
+    **Por qué hace falta**: los ejes de `compute_hinge_axes` están
+    fijados en el espacio-mundo de la bind pose. En cuanto una pata
+    empiece a moverse durante el ciclo de marcha, ese eje "congelado en
+    el mundo" deja de ser válido — la bisagra de la rodilla debe girar
+    CON el muslo (co-rotar con el hueso padre), no quedarse fija en una
+    dirección de mundo absoluta. Expresar cada eje en el marco LOCAL del
+    padre en bind pose permite recalcular la dirección de mundo válida
+    en CUALQUIER pose futura: en cualquier iteración de CCD, el eje de
+    mundo válido en ESE momento es
+    ``rotación_global_actual_del_padre @ eje_local`` — verificado en
+    `test_hinge_axis_co_rotates_with_ancestor_perturbation`, la prueba
+    que de verdad importa aquí (no solo que el round-trip a bind pose
+    funcione, sino que el eje siga siendo válido cuando algo más arriba
+    en la jerarquía se mueve).
+
+    Esta función SOLO hace la conversión de marco y la deja lista para
+    usar; NO aplica ningún límite de ángulo ni toca `ik_solver.solve_ik_ccd`
+    todavía — eso es la tarea siguiente, una vez el marco local esté
+    verificado (esta misma tarea).
+
+    `parent_index` (el nodo padre de cada hueso) es el mismo concepto
+    que ya usa `solve_ik_ccd` en su propio bucle CCD
+    (``skin_data.node_parent[node_index]``) — no se inventa uno nuevo
+    aquí.
+    """
+    local_matrix_of = {
+        node_index: trs_to_matrix(trs.translation, trs.rotation, trs.scale)
+        for node_index, trs in skin_data.node_trs.items()
+    }
+    bind_globals = compute_global_matrices(
+        skin_data.root_node_index, skin_data.node_children, local_matrix_of
+    )
+
+    name_to_index = name_to_node_index(skin_data)
+
+    local_axes: dict[str, np.ndarray] = {}
+    for bone_name, world_axis in hinge_axes.items():
+        node_index = name_to_index[bone_name]
+        parent_index = skin_data.node_parent[node_index]
+        parent_rotation = bind_globals[parent_index][:3, :3]
+        local_axis = parent_rotation.T @ world_axis
+        local_axes[bone_name] = local_axis / np.linalg.norm(local_axis)
+
+    return local_axes

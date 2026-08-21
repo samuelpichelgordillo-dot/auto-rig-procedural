@@ -47,11 +47,12 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   clasificación de patas de apoyo + IK simple (CCD) de una sola pata +
   trayectoria de ciclo para una sola pata + dirección de zancada
   automática + reparto de fase entre patas + pose de marcha con varias
-  patas a la vez + ejes de bisagra por articulación hechas y
-  verificadas; falta APLICAR el límite de ángulo de verdad dentro de
-  `solve_ik_ccd` (esta tarea solo calculó los ejes, no los usa
-  todavía), resolver el signo de `stride_direction`, y la pose de
-  "asombro" antes de poder cerrarlo.
+  patas a la vez + ejes de bisagra por articulación (mundo bind pose y
+  ahora también marco local del padre) hechas y verificadas; falta
+  APLICAR el límite de ángulo de verdad dentro de `solve_ik_ccd` (esta
+  tarea tampoco lo hace — solo deja el eje local listo para usarse en
+  cualquier pose futura), resolver el signo de `stride_direction`, y la
+  pose de "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
 
@@ -1332,3 +1333,91 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   de `solve_ik_ccd` (esta tarea solo calcula los ejes, no restringe
   ninguna rotación todavía) — más resolución del signo de
   `stride_direction` y la pose de "asombro".
+
+- **[Módulo 3 — ejes de bisagra en marco local del padre] 2026-08-21**
+  — `joint_limits.hinge_axes_in_local_frame(skin_data, hinge_axes)`:
+  convierte cada eje de `compute_hinge_axes` (fijado en el
+  espacio-mundo de la BIND POSE) al marco LOCAL de su hueso padre en
+  bind pose. Todavía NO aplica ningún límite de ángulo ni toca
+  `solve_ik_ccd` — eso sigue siendo la tarea siguiente, ahora sí con el
+  marco de referencia correcto verificado.
+
+  **Por qué hace falta (el motivo real de esta tarea)**: un eje fijado
+  en coordenadas de MUNDO solo es válido mientras la pata está en bind
+  pose. En cuanto el ciclo de marcha empiece a mover la pata, ese eje
+  "congelado en el mundo" deja de tener sentido — la bisagra de la
+  rodilla debe girar CON el muslo (co-rotar con el hueso padre), no
+  quedarse fija en una dirección absoluta. Expresado en el marco LOCAL
+  del padre en bind pose, el eje de mundo válido en CUALQUIER pose
+  futura se recupera con una simple multiplicación:
+  `rotación_global_actual_del_padre @ eje_local` — exactamente el tipo
+  de recomposición que `solve_ik_ccd` ya hace en cada sub-paso de CCD
+  para otras cosas (mismo concepto de `parent_index` que ya usa su
+  propio bucle).
+
+  **Algoritmo**: `local_axis = parent_rotation.T @ world_axis`, donde
+  `parent_rotation` es la matriz de rotación 3x3 (extraída de
+  `compute_global_matrices` sobre bind pose) del nodo PADRE de ese
+  hueso — la transpuesta de una rotación pura es su inversa, evita
+  invertir explícitamente. `compute_global_matrices` se llama UNA VEZ
+  para las matrices de bind pose de todo el esqueleto, no por hueso.
+
+  **Test que de verdad importa: co-rotación con una pose distinta de
+  bind pose** (`test_hinge_axis_co_rotates_with_ancestor_perturbation`,
+  cow, 2 huesos): antepone una rotación de 30° sobre Y en la rotación
+  LOCAL de la RAÍZ del esqueleto entero (así toda rotación global
+  descendiente queda multiplicada por la misma rotación por la
+  izquierda, sin ambigüedad de qué nodo perturbar), recalcula las
+  matrices globales de esa pose PERTURBADA, y confirma que
+  `nueva_rotación_global_del_padre @ eje_local` coincide (atol=1e-6, el
+  margen que ya usa el resto del proyecto para composiciones largas de
+  cuaterniones) con rotar el `world_axis` ORIGINAL directamente por esa
+  misma rotación de 30° — calculado de forma completamente
+  independiente (rotación de vector vía cuaternión, no reutilizando
+  ninguna matriz de la función bajo prueba). Confirma que el eje local
+  sirve para recuperar la dirección de mundo válida en una pose
+  CUALQUIERA, no solo en la propia bind pose de la que se derivó —
+  exactamente lo que hará falta cuando `solve_ik_ccd` esté resolviendo
+  otras articulaciones de la misma pata (tarea siguiente).
+
+  **Segundo test de verificación cruzada**
+  (`test_local_axis_reconstructs_world_axis_via_independent_global_rotation`,
+  cow, los mismos 3 huesos bien definidos de la tarea anterior):
+  recalcula la rotación global de bind pose del nodo padre recorriendo
+  a mano la cadena de padres desde `root_node_index` y componiendo
+  cuaterniones con `quat_multiply` — sin pasar por
+  `compute_global_matrices` en absoluto — y compara, rotando el eje
+  local por esa vía, contra `parent_rotation @ local_axis` (con el
+  `parent_rotation` que sí usa la función bajo prueba). Confirma que no
+  se cogió el nodo equivocado como "padre" ni se invirtió mal la
+  rotación, por una ruta de cálculo genuinamente distinta. Ambos tests
+  necesitaron `atol=1e-6` en vez de `1e-8` (primer intento): la
+  composición manual de cuaterniones a lo largo de cadenas largas
+  acumula el mismo nivel de ruido de punto flotante ya visto y
+  documentado en checkpoints anteriores del proyecto (p. ej. el
+  auto-chequeo de `verify_identity_rotation_reproduces_bind_pose` del
+  Módulo 2, error ~1e-6), no un bug.
+
+  Sin script de depuración visual nuevo para esta tarea (decisión
+  explícita, no un descuido): a diferencia de los ejes en sí mismos
+  (ambiguos/visuales, merecían un render para juzgar a ojo si tenían
+  sentido anatómico), esto es una transformación de marco de referencia
+  puramente matemática con una propiedad exacta y verificable
+  numéricamente — el test de co-rotación ya da una verificación más
+  precisa que cualquier plot.
+
+  **`backend/tests/test_joint_limits.py`** ampliado con 8 tests nuevos
+  (17 en total, antes 9): reconstrucción del eje de mundo por una ruta
+  independiente (3 huesos de cow), norma unitaria de los ejes locales
+  en los 3 modelos, y co-rotación bajo perturbación del ancestro (2
+  huesos de cow, la prueba clave de esta tarea).
+
+  **Verificación:** `pytest backend/tests/` completo → **94 passed**, 0
+  failed (86 de antes + 8 nuevos).
+
+  Ejes de bisagra en marco local verificados, incluida la propiedad de
+  co-rotación que es la razón de ser de esta tarea. Todavía pendiente
+  del Módulo 3: APLICAR el límite de ángulo de verdad dentro de
+  `solve_ik_ccd` usando estos ejes locales (esta tarea tampoco lo
+  hace), resolución del signo de `stride_direction`, y la pose de
+  "asombro".

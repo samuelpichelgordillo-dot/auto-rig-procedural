@@ -14,10 +14,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from backend.app.ik_solver import chain_bone_names
-from backend.app.joint_limits import DEFAULT_DEGENERATE_ANGLE_THRESHOLD_DEG, compute_hinge_axes
+from backend.app.ik_solver import chain_bone_names, name_to_node_index
+from backend.app.joint_limits import (
+    DEFAULT_DEGENERATE_ANGLE_THRESHOLD_DEG,
+    compute_hinge_axes,
+    hinge_axes_in_local_frame,
+)
 from backend.app.limb_classification import classify_support_limbs
 from backend.app.skeletonization import build_skeleton_tree
+from backend.app.skinning_quality import (
+    axis_angle_to_quat,
+    compute_global_matrices,
+    quat_conjugate,
+    quat_multiply,
+    read_skin_data,
+    trs_to_matrix,
+)
 
 _SAMPLES_DIR = Path(__file__).resolve().parents[2] / "samples"
 _MODELS = ["cow", "biped", "bat"]
@@ -31,6 +43,14 @@ def tree_and_limbs_by_model():
         limbs = classify_support_limbs(tree, root, hierarchy)
         data[model] = (tree, hierarchy, {limb.chain_root: limb for limb in limbs})
     return data
+
+
+@pytest.fixture(scope="module")
+def skin_data_by_model():
+    return {
+        model: read_skin_data(str(_SAMPLES_DIR / "_debug" / f"{model}_rigged.glb"))
+        for model in _MODELS
+    }
 
 
 def _direct_hinge_axis(tree, hierarchy, bone_name: str) -> np.ndarray:
@@ -178,3 +198,152 @@ def test_all_returned_axes_are_unit_length(tree_and_limbs_by_model, model):
             assert np.linalg.norm(axis) == pytest.approx(1.0), (
                 f"{model}: eje de {bone_name} no tiene norma 1 ({np.linalg.norm(axis)})"
             )
+
+
+# --- hinge_axes_in_local_frame ---
+
+
+def _independent_bind_rotation_quat(skin_data, node_index) -> np.ndarray:
+    """Recálculo independiente de la rotación GLOBAL de bind pose de un
+    nodo: recorre a mano la cadena de padres desde `root_node_index`
+    hasta `node_index`, componiendo cuaterniones con `quat_multiply` —
+    NO usa `compute_global_matrices` (esa es la ruta que usa la función
+    bajo prueba)."""
+    chain = [node_index]
+    node = node_index
+    while node != skin_data.root_node_index:
+        node = skin_data.node_parent[node]
+        chain.append(node)
+    chain.reverse()  # root -> ... -> node_index
+
+    quat = skin_data.node_trs[chain[0]].rotation
+    for node in chain[1:]:
+        quat = quat_multiply(quat, skin_data.node_trs[node].rotation)
+    return quat
+
+
+def _rotate_vector_by_quat(vector: np.ndarray, quat: np.ndarray) -> np.ndarray:
+    """v' = q · (v,0) · conj(q)."""
+    v_quat = np.array([vector[0], vector[1], vector[2], 0.0])
+    rotated = quat_multiply(quat_multiply(quat, v_quat), quat_conjugate(quat))
+    return rotated[:3]
+
+
+# Mismos huesos bien definidos de cow ya usados en
+# test_hinge_axis_matches_direct_formula_for_well_defined_joints.
+_COW_WELL_DEFINED_BONES_2 = [
+    (31, "bone_31_10"),
+    (31, "bone_4_31"),
+    (3, "bone_3_29"),
+]
+
+
+@pytest.mark.parametrize("chain_root,bone_name", _COW_WELL_DEFINED_BONES_2)
+def test_local_axis_reconstructs_world_axis_via_independent_global_rotation(
+    tree_and_limbs_by_model, skin_data_by_model, chain_root, bone_name
+):
+    """Confirma que `hinge_axes_in_local_frame` no cogió el nodo
+    equivocado como "padre" ni invirtió mal la rotación: recalcula la
+    rotación global del padre por una ruta genuinamente distinta
+    (composición manual de cuaterniones, no `compute_global_matrices`) y
+    comprueba que rotar el eje LOCAL devuelto por esa rotación
+    reconstruye el mismo `world_axis` que `parent_rotation @ local_axis`
+    (con el `parent_rotation` que sí usa la función bajo prueba)."""
+    tree, hierarchy, limbs_by_root = tree_and_limbs_by_model["cow"]
+    skin_data = skin_data_by_model["cow"]
+    limb = limbs_by_root[chain_root]
+
+    world_axes = compute_hinge_axes(limb, hierarchy, tree)
+    local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+    assert bone_name in local_axes
+
+    name_to_index = name_to_node_index(skin_data)
+    node_index = name_to_index[bone_name]
+    parent_index = skin_data.node_parent[node_index]
+
+    # parent_rotation "oficial", por la misma ruta que usa la función bajo prueba.
+    local_matrix_of = {
+        idx: trs_to_matrix(trs.translation, trs.rotation, trs.scale)
+        for idx, trs in skin_data.node_trs.items()
+    }
+    bind_globals = compute_global_matrices(
+        skin_data.root_node_index, skin_data.node_children, local_matrix_of
+    )
+    parent_rotation = bind_globals[parent_index][:3, :3]
+    expected = parent_rotation @ local_axes[bone_name]
+
+    # Ruta independiente: cuaternión compuesto a mano, rotación de vector
+    # vía quat_multiply/quat_conjugate, sin pasar por compute_global_matrices
+    # ni por ninguna matriz.
+    independent_parent_quat = _independent_bind_rotation_quat(skin_data, parent_index)
+    independent_result = _rotate_vector_by_quat(local_axes[bone_name], independent_parent_quat)
+
+    np.testing.assert_allclose(independent_result, expected, atol=1e-6)
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_local_axes_are_unit_length(tree_and_limbs_by_model, skin_data_by_model, model):
+    tree, hierarchy, limbs_by_root = tree_and_limbs_by_model[model]
+    skin_data = skin_data_by_model[model]
+    for limb in limbs_by_root.values():
+        world_axes = compute_hinge_axes(limb, hierarchy, tree)
+        local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+        for bone_name, axis in local_axes.items():
+            assert np.linalg.norm(axis) == pytest.approx(1.0), (
+                f"{model}: eje local de {bone_name} no tiene norma 1"
+            )
+
+
+_COW_COROTATION_TEST_BONES = [
+    (31, "bone_31_10"),
+    (3, "bone_3_29"),
+]
+
+
+@pytest.mark.parametrize("chain_root,bone_name", _COW_COROTATION_TEST_BONES)
+def test_hinge_axis_co_rotates_with_ancestor_perturbation(
+    tree_and_limbs_by_model, skin_data_by_model, chain_root, bone_name
+):
+    """La prueba MÁS importante de esta tarea: confirma que el eje local
+    realmente sirve para recuperar la dirección de mundo válida en una
+    pose DISTINTA de la bind pose, no solo en bind pose misma — que es
+    exactamente lo que hará falta cuando `solve_ik_ccd` esté resolviendo
+    otras articulaciones de la misma pata (tarea siguiente)."""
+    tree, hierarchy, limbs_by_root = tree_and_limbs_by_model["cow"]
+    skin_data = skin_data_by_model["cow"]
+    limb = limbs_by_root[chain_root]
+
+    world_axes = compute_hinge_axes(limb, hierarchy, tree)
+    local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+
+    # Rotación extra antepuesta en la RAÍZ del esqueleto entero — así toda
+    # rotación global descendiente queda multiplicada por la misma
+    # extra_rotation por la izquierda, sin ambigüedad de qué nodo perturbar.
+    extra_rotation = axis_angle_to_quat(np.array([0.0, 1.0, 0.0]), math.radians(30))
+    root_trs = skin_data.node_trs[skin_data.root_node_index]
+    perturbed_root_local = quat_multiply(extra_rotation, root_trs.rotation)
+
+    local_matrix_of = {
+        idx: trs_to_matrix(trs.translation, trs.rotation, trs.scale)
+        for idx, trs in skin_data.node_trs.items()
+    }
+    local_matrix_of[skin_data.root_node_index] = trs_to_matrix(
+        root_trs.translation, perturbed_root_local, root_trs.scale
+    )
+    perturbed_globals = compute_global_matrices(
+        skin_data.root_node_index, skin_data.node_children, local_matrix_of
+    )
+
+    name_to_index = name_to_node_index(skin_data)
+    node_index = name_to_index[bone_name]
+    parent_index = skin_data.node_parent[node_index]
+
+    new_parent_rotation = perturbed_globals[parent_index][:3, :3]
+    new_world_axis = new_parent_rotation @ local_axes[bone_name]
+
+    # Esperado: rotar el world_axis ORIGINAL (antes de convertir a local)
+    # por extra_rotation directamente, como rotación de vector — NO
+    # reutiliza new_parent_rotation, sería circular.
+    expected = _rotate_vector_by_quat(world_axes[bone_name], extra_rotation)
+
+    np.testing.assert_allclose(new_world_axis, expected, atol=1e-6)
