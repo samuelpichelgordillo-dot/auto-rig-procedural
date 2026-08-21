@@ -20,6 +20,7 @@ from backend.app.gait_cycle import (
     safe_stride_amplitude_pct,
 )
 from backend.app.ik_solver import (
+    DEFAULT_HINGE_MAX_ANGLE_DEG,
     DEFAULT_MAX_ITERATIONS,
     chain_bone_names,
     name_to_node_index,
@@ -28,7 +29,11 @@ from backend.app.ik_solver import (
     tip_bone_and_offset,
     verify_zero_displacement_converges_immediately,
 )
-from backend.app.joint_limits import compute_hinge_axes, hinge_axes_in_local_frame
+from backend.app.joint_limits import (
+    compute_hinge_axes,
+    hinge_axes_in_local_frame,
+    signed_hinge_angle_deg,
+)
 from backend.app.limb_classification import classify_support_limbs
 from backend.app.skeletonization import build_skeleton_tree
 from backend.app.skinning_quality import (
@@ -272,4 +277,163 @@ def test_constrained_rotation_axis_matches_hinge(scenario_by_model, chain_root, 
         f"{bone_name}: eje de la rotación aplicada ({applied_axis}) no es "
         f"paralelo/antiparalelo al eje de bisagra esperado ({expected_axis}), "
         f"cos={cosine}"
+    )
+
+
+# --- hinge_max_angle_deg: límite de ÁNGULO (flexión/extensión) dentro de
+# cada bisagra ---
+#
+# Alcance de esta tarea: recortar el ángulo total acumulado (respecto a
+# bind pose) al que cada bisagra puede llegar, dentro de
+# [-hinge_max_angle_deg, +hinge_max_angle_deg] — sigue restringiendo el
+# EJE (tarea anterior) y AHORA también el rango. Motivado por huesos de
+# dedos que, sin ningún tope de ángulo, giraban 200-350° durante un ciclo
+# de marcha normal (ver docstring de `solve_ik_ccd`) — anatómicamente
+# absurdo pero invisible en la verificación visual de la silueta general
+# de la pata, porque son huesos pequeños cerca de la punta del pie.
+
+
+@pytest.mark.parametrize("model", _MODELS)
+def test_hinge_angle_cap_still_converges_across_full_cycle(scenario_by_model, model):
+    """Verificado independientemente (fuera de este entorno) antes de
+    esta tarea: con `hinge_max_angle_deg=90.0` (el default), 0 fallos en
+    las 8 patas de los 3 modelos, 24 fases cada una. Si esto sale
+    distinto aquí, algo se implementó diferente de lo especificado."""
+    tree, hierarchy, limbs, skin_data = scenario_by_model[model]
+    direction = detect_stride_direction(limbs, tree)
+
+    for limb in limbs:
+        bind_pos = _bind_foot_position(tree, limb)
+        chain_root_pos = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+        max_length = max_chain_bone_length(limb, hierarchy, tree)
+        amplitude = safe_stride_amplitude_pct(bind_pos, chain_root_pos, max_length, direction)
+
+        world_axes = compute_hinge_axes(limb, hierarchy, tree)
+        local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+
+        failures = []
+        for i in range(24):
+            phase = i / 24
+            target = foot_target_at_phase(
+                bind_pos, chain_root_pos, direction, phase, stride_amplitude_pct=amplitude
+            )
+            result = solve_ik_ccd(
+                skin_data, limb, hierarchy, bind_pos, target,
+                hinge_axes_local=local_axes,
+                hinge_max_angle_deg=DEFAULT_HINGE_MAX_ANGLE_DEG,
+                max_iterations=DEFAULT_MAX_ITERATIONS,
+            )
+            if not result.converged:
+                failures.append((phase, result.final_error, result.iterations_used))
+
+        assert not failures, (
+            f"{model}/{_limb_id(limb)}: {len(failures)}/24 fases no convergieron "
+            f"con tope de ángulo de bisagra: {failures}"
+        )
+
+
+def test_hinge_angle_cap_has_real_teeth(scenario_by_model):
+    """cow, chain_root=27, bone_28_13 — el hueso de dedo que, SIN ningún
+    tope efectivo, giraba ~350° durante un ciclo de marcha normal (ver
+    docstring de `solve_ik_ccd`). Resuelve el MISMO ciclo dos veces: sin
+    tope efectivo (`hinge_max_angle_deg=1000.0`, un valor que ninguna
+    bisagra alcanza) y con el tope real (90.0). Confirma que (a) sin
+    tope el ángulo SÍ excede claramente ±90° en alguna fase — reproduce
+    el hallazgo, no lo da por hecho de memoria — y (b) con el tope el
+    ángulo NUNCA lo excede, dentro de tolerancia numérica."""
+    tree, hierarchy, limbs, skin_data = scenario_by_model["cow"]
+    limb = next(l for l in limbs if l.chain_root == 27)
+    bind_pos = _bind_foot_position(tree, limb)
+    direction = detect_stride_direction(limbs, tree)
+    chain_root_pos = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+    max_length = max_chain_bone_length(limb, hierarchy, tree)
+    amplitude = safe_stride_amplitude_pct(bind_pos, chain_root_pos, max_length, direction)
+
+    world_axes = compute_hinge_axes(limb, hierarchy, tree)
+    local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+
+    bone_name = "bone_28_13"
+    assert bone_name in local_axes
+    name_to_index = name_to_node_index(skin_data)
+    node_index = name_to_index[bone_name]
+
+    _NUMERIC_TOLERANCE_DEG = 1.0  # margen sobre 90.0 para ruido de convergencia/CCD
+
+    angles_uncapped = []
+    angles_capped = []
+    for i in range(24):
+        phase = i / 24
+        target = foot_target_at_phase(
+            bind_pos, chain_root_pos, direction, phase, stride_amplitude_pct=amplitude
+        )
+
+        result_uncapped = solve_ik_ccd(
+            skin_data, limb, hierarchy, bind_pos, target,
+            hinge_axes_local=local_axes, hinge_max_angle_deg=1000.0,
+            max_iterations=DEFAULT_MAX_ITERATIONS,
+        )
+        result_capped = solve_ik_ccd(
+            skin_data, limb, hierarchy, bind_pos, target,
+            hinge_axes_local=local_axes, hinge_max_angle_deg=90.0,
+            max_iterations=DEFAULT_MAX_ITERATIONS,
+        )
+
+        angles_uncapped.append(
+            signed_hinge_angle_deg(
+                skin_data, node_index, result_uncapped.local_rotations[node_index],
+                local_axes[bone_name],
+            )
+        )
+        angles_capped.append(
+            signed_hinge_angle_deg(
+                skin_data, node_index, result_capped.local_rotations[node_index],
+                local_axes[bone_name],
+            )
+        )
+
+    max_abs_uncapped = max(abs(a) for a in angles_uncapped)
+    max_abs_capped = max(abs(a) for a in angles_capped)
+
+    assert max_abs_uncapped > 90.0, (
+        f"cow/{bone_name}: sin tope efectivo, se esperaba superar 90° en alguna fase, "
+        f"máximo observado {max_abs_uncapped:.1f}° (ángulos: {angles_uncapped})"
+    )
+    assert max_abs_capped <= 90.0 + _NUMERIC_TOLERANCE_DEG, (
+        f"cow/{bone_name}: con hinge_max_angle_deg=90.0, se excedió el tope: "
+        f"máximo observado {max_abs_capped:.1f}° (ángulos: {angles_capped})"
+    )
+
+
+def test_hinge_angle_cap_blocks_out_of_range_target(scenario_by_model):
+    """cow, chain_root=31: un objetivo con amplitud de zancada muy por
+    encima de `safe_stride_amplitude_pct` (a propósito, ignorando ese
+    recorte) que exigiría doblar la bisagra más de 90° para alcanzarlo.
+    Con el tope de ángulo activo, `solve_ik_ccd` debe NEGARSE a
+    converger en vez de "hacer trampa" excediendo el ángulo permitido —
+    el límite tiene prioridad sobre alcanzar el objetivo cuando entran en
+    conflicto."""
+    tree, hierarchy, limbs, skin_data = scenario_by_model["cow"]
+    limb = next(l for l in limbs if l.chain_root == 31)
+    bind_pos = _bind_foot_position(tree, limb)
+    direction = detect_stride_direction(limbs, tree)
+    chain_root_pos = np.array(tree.nodes[limb.chain_root]["pos"], dtype=np.float64)
+
+    world_axes = compute_hinge_axes(limb, hierarchy, tree)
+    local_axes = hinge_axes_in_local_frame(skin_data, world_axes)
+
+    # Amplitud deliberadamente exagerada (muy por encima de la segura),
+    # objetivo en la fase de máxima extensión hacia adelante.
+    target = foot_target_at_phase(
+        bind_pos, chain_root_pos, direction, phase=0.0, stride_amplitude_pct=3.0
+    )
+
+    result_capped = solve_ik_ccd(
+        skin_data, limb, hierarchy, bind_pos, target,
+        hinge_axes_local=local_axes, hinge_max_angle_deg=90.0,
+        max_iterations=DEFAULT_MAX_ITERATIONS,
+    )
+    assert not result_capped.converged, (
+        "cow/chain_root=31: se esperaba que el tope de ángulo IMPIDIERA converger "
+        f"a un objetivo con amplitud exagerada, pero convergió "
+        f"(error final={result_capped.final_error:.6f})"
     )

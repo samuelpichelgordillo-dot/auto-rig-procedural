@@ -37,7 +37,13 @@ import numpy as np
 
 from backend.app.ik_solver import chain_bone_names, name_to_node_index
 from backend.app.limb_classification import LimbChain
-from backend.app.skinning_quality import SkinData, compute_global_matrices, trs_to_matrix
+from backend.app.skinning_quality import (
+    SkinData,
+    compute_global_matrices,
+    quat_conjugate,
+    quat_multiply,
+    trs_to_matrix,
+)
 
 DEFAULT_DEGENERATE_ANGLE_THRESHOLD_DEG = 10.0
 
@@ -252,3 +258,34 @@ def hinge_axes_in_local_frame(
         local_axes[bone_name] = local_axis / np.linalg.norm(local_axis)
 
     return local_axes
+
+
+def signed_hinge_angle_deg(
+    skin_data: SkinData,
+    node_index: int,
+    local_rotation_quat: np.ndarray,
+    hinge_axis_local: np.ndarray,
+) -> float:
+    """Ángulo con signo (grados) de ``local_rotation_quat`` respecto a la
+    rotación de BIND POSE de ``node_index``, medido alrededor de
+    ``hinge_axis_local``.
+
+    Propiedad exacta en la que se apoya (verificada: componente
+    perpendicular al eje ~1e-8, prácticamente cero — ver
+    `test_ik_solver.py`): cada incremento LOCAL que `ik_solver.solve_ik_ccd`
+    aplica a un hueso restringido a un eje de bisagra es, por
+    construcción, una rotación PURA alrededor de ese `hinge_axis_local`
+    fijo (mismo eje en cada sub-paso, co-rotando con el padre — ver
+    `hinge_axes_in_local_frame`). El delta ACUMULADO entre la rotación
+    actual y la de bind pose (``local_rotation_quat · conj(bind_rotation)``)
+    es entonces también una rotación pura alrededor del mismo eje, y su
+    ángulo con signo se extrae de forma exacta y numéricamente estable
+    con ``2 * arctan2(dot(delta_xyz, hinge_axis_local), delta_w)`` — NO
+    ``arccos``, que pierde el signo y pierde precisión cerca de 180°.
+    """
+    bind_rotation = skin_data.node_trs[node_index].rotation
+    delta = quat_multiply(local_rotation_quat, quat_conjugate(bind_rotation))
+    delta = delta / np.linalg.norm(delta)
+    sin_half = float(np.dot(delta[:3], hinge_axis_local))
+    cos_half = float(delta[3])
+    return math.degrees(2.0 * math.atan2(sin_half, cos_half))

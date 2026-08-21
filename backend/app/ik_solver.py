@@ -16,6 +16,7 @@ directamente aquí porque solo rota UN hueso a la vez y no necesita saber
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -62,6 +63,14 @@ from backend.app.skinning_quality import (
 # no de este cimiento.
 DEFAULT_MAX_ITERATIONS = 1000
 DEFAULT_TOLERANCE = 1e-4
+
+# Tope FIJO y genérico de ángulo de flexión/extensión dentro de cada
+# bisagra, respecto a la rotación de bind pose — igual para TODOS los
+# huesos con eje de bisagra, no calibrado por hueso a propósito (ver
+# docstring de `solve_ik_ccd`, sección `hinge_max_angle_deg`, para el
+# hallazgo que motivó este valor: huesos de dedos que giraban 200-350°
+# durante un ciclo de marcha normal sin ningún tope de ángulo).
+DEFAULT_HINGE_MAX_ANGLE_DEG = 90.0
 
 
 def _bone_name(parent_skel_node: int, child_skel_node: int) -> str:
@@ -179,6 +188,7 @@ def solve_ik_ccd(
     bind_foot_position: np.ndarray,
     target_position: np.ndarray,
     hinge_axes_local: dict[str, np.ndarray] | None = None,
+    hinge_max_angle_deg: float = DEFAULT_HINGE_MAX_ANGLE_DEG,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> IKResult:
@@ -256,7 +266,38 @@ def solve_ik_ccd(
     current_axis`, `cos = dot(...)`) en vez del ángulo sin signo
     (`arccos`) del camino sin restringir — una bisagra necesita saber en
     qué SENTIDO girar sobre su único eje, no solo cuánto.
+
+    ``hinge_max_angle_deg`` (default `DEFAULT_HINGE_MAX_ANGLE_DEG` =
+    90.0): tope simétrico de flexión/extensión, `[-hinge_max_angle_deg,
+    +hinge_max_angle_deg]` respecto a la rotación de BIND POSE de cada
+    hueso, alrededor de su propio eje de bisagra — solo tiene efecto
+    sobre huesos presentes en `hinge_axes_local` (con `hinge_axes_local
+    is None`, sin cambio de comportamiento). Un valor FIJO, igual para
+    todas las bisagras, deliberadamente NO calibrado por hueso: se probó
+    medir el rango de ángulo que cada bisagra recorre durante un ciclo
+    de marcha normal y calibrar el tope a partir de eso (mismo criterio
+    que `DEFAULT_MAX_ITERATIONS` o `degenerate_angle_threshold_deg`) —
+    se descartó porque varios huesos de DEDOS (p.ej. `bone_28_13` en
+    cow, `bone_21_102` en biped) giran 200-350° sin ningún tope, que es
+    precisamente el comportamiento anatómicamente absurdo que hay que
+    cortar, no validar calibrando a partir de él. 90° es 2-3x el rango
+    que ya usan de forma razonable los huesos que se comportan bien
+    (`bone_31_10`: ~30°, `bone_3_29`: ~35°, `bone_17_22` de bat: ~36°),
+    y muy por debajo de los giros de 200-350° que corta de raíz.
+
+    Cada sub-paso restringido (con eje conocido) calcula, ANTES de
+    aplicar la rotación: (1) el ángulo total acumulado actual respecto a
+    bind pose (`joint_limits.signed_hinge_angle_deg`); (2) el ángulo
+    total que CCD querría alcanzar sumando el incremento de esta pasada;
+    (3) lo recorta a `[-hinge_max_angle_deg, hinge_max_angle_deg]`; (4)
+    aplica solo el incremento AJUSTADO tras el recorte (la diferencia
+    entre el total recortado y el total actual), no el que CCD pedía
+    originalmente — si el hueso ya está en el límite y CCD querría
+    seguir empujando en la misma dirección, el incremento ajustado es
+    ~0 y se salta esta pasada para ese hueso, igual que cuando el ángulo
+    sin restringir ya es ~0.
     """
+    from backend.app.joint_limits import signed_hinge_angle_deg
     chain_names = chain_bone_names(limb, hierarchy)
     name_to_index = name_to_node_index(skin_data)
     chain_indices = [name_to_index[name] for name in chain_names]
@@ -312,7 +353,21 @@ def solve_ik_ccd(
                 if abs(signed_angle) < 1e-8:
                     continue
 
-                world_rotation = axis_angle_to_quat(current_axis, signed_angle)
+                old_local_for_angle = local_rotation.get(
+                    node_index, skin_data.node_trs[node_index].rotation
+                )
+                current_total_deg = signed_hinge_angle_deg(
+                    skin_data, node_index, old_local_for_angle, hinge_axes_local[bone_name]
+                )
+                new_total_deg = current_total_deg + math.degrees(signed_angle)
+                new_total_clamped_deg = float(
+                    np.clip(new_total_deg, -hinge_max_angle_deg, hinge_max_angle_deg)
+                )
+                actual_delta_rad = math.radians(new_total_clamped_deg - current_total_deg)
+                if abs(actual_delta_rad) < 1e-8:
+                    continue  # ya en el límite, CCD querría seguir empujando igual
+
+                world_rotation = axis_angle_to_quat(current_axis, actual_delta_rad)
             else:
                 dot = float(np.clip(np.dot(to_effector, to_target), -1.0, 1.0))
                 angle = float(np.arccos(dot))

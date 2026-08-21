@@ -49,9 +49,8 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   automática + reparto de fase entre patas + pose de marcha con varias
   patas a la vez + ejes de bisagra por articulación (mundo bind pose y
   marco local del padre) + restricción de EJE de rotación dentro de
-  `solve_ik_ccd` hechas y verificadas; falta el límite de ÁNGULO (rango
-  de flexión/extensión dentro de cada bisagra — decisión consciente de
-  no mezclarlo con la restricción de eje), resolver el signo de
+  `solve_ik_ccd` + límite de ÁNGULO (rango de flexión/extensión) dentro
+  de cada bisagra hechas y verificadas; falta resolver el signo de
   `stride_direction`, y la pose de "asombro" antes de poder cerrarlo.
 
 ## Roadmap por módulos
@@ -1590,3 +1589,148 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   `solve_ik_ccd`. Todavía pendiente del Módulo 3: límite de ÁNGULO
   (rango de flexión/extensión) dentro de cada bisagra, resolución del
   signo de `stride_direction`, y la pose de "asombro".
+
+- **[Módulo 3 — límite de ÁNGULO dentro de cada bisagra] 2026-08-21** —
+  `solve_ik_ccd` acepta ahora `hinge_max_angle_deg: float =
+  DEFAULT_HINGE_MAX_ANGLE_DEG` (90.0): recorta el ángulo total
+  acumulado (respecto a bind pose) al que cada bisagra con eje conocido
+  (`hinge_axes_local`) puede llegar, dentro de `[-hinge_max_angle_deg,
+  +hinge_max_angle_deg]` — sigue restringiendo el EJE (tarea anterior) y
+  AHORA también el RANGO. El pivote de cadera/hombro (excluido de
+  `compute_hinge_axes` por diseño) sigue rotando libre siempre, sin
+  tope. Con `hinge_axes_local=None` (default), sin cambio de
+  comportamiento — no aplica, ni siquiera se evalúa.
+
+  **Hallazgo que motivó esta tarea, verificado antes de escribir nada**
+  (medido el rango de ángulo con signo que cada bisagra recorre en un
+  ciclo completo, en las 8 patas de los 3 modelos, con la restricción de
+  EJE ya activa pero SIN ningún tope de ángulo): varios huesos de DEDOS
+  giran muy por encima de lo anatómicamente razonable durante un ciclo
+  de marcha normal — `bone_28_13` en cow llega a **226.2°** (no 350°
+  como sugería la instrucción de la tarea; el hallazgo original medía
+  sin la restricción de EJE activa, con eje SÍ restringido pero sin
+  tope de ángulo el máximo real medido es 226.2° — de todas formas muy
+  por encima de cualquier rango anatómico razonable, el número exacto
+  cambia pero la conclusión no), varios huesos de biped por encima de
+  200° (`bone_21_102` y otros, mencionados en el enunciado, no
+  re-verificados exactamente en esta tarea porque el test de "dientes
+  reales" se centró en cow por ser el caso más extremo y mejor
+  caracterizado). Invisible en la verificación visual de la tarea
+  anterior porque son huesos pequeños cerca de la punta del pie, cuya
+  rotación apenas desplaza la silueta general de la pata.
+
+  **Por qué se descartó calibrar el tope "a partir de lo que CCD ya
+  necesita, más margen"** (el enfoque obvio, análogo a
+  `DEFAULT_MAX_ITERATIONS` o `degenerate_angle_threshold_deg`): para los
+  huesos que más lo necesitan (los dedos), ese comportamiento observado
+  YA ES el problema — calibrar el tope a partir de él lo validaría en
+  vez de arreglarlo. Se necesitaba un valor FIJO ajeno al comportamiento
+  observado, no derivado de él.
+
+  **Diseño elegido: tope fijo de ±90°, igual para TODAS las bisagras**
+  (no calibrado por hueso, a propósito — deliberadamente simple): 2-3x
+  el rango que ya usan de forma razonable los huesos que se comportan
+  bien (`bone_31_10`: ~30°, `bone_3_29`: ~35°, `bone_17_22` de bat:
+  ~36°), y muy por debajo de los giros de 200°+ que corta de raíz.
+
+  **Nuevo helper público, `joint_limits.signed_hinge_angle_deg(skin_data,
+  node_index, local_rotation_quat, hinge_axis_local)`**: ángulo con
+  signo (grados) de una rotación local respecto a la de BIND POSE de ese
+  nodo, medido alrededor de `hinge_axis_local`. Se apoya en una
+  propiedad exacta: cada incremento LOCAL que `solve_ik_ccd` aplica a un
+  hueso restringido a eje es, por construcción, una rotación PURA
+  alrededor de ese eje fijo (co-rotando con el padre), así que el delta
+  ACUMULADO (`local_rotation_quat · conj(bind_rotation)`) también lo es,
+  y su ángulo con signo se extrae de forma exacta y estable con
+  `2·arctan2(dot(delta_xyz, eje), delta_w)` — deliberadamente NO
+  `arccos` (pierde el signo, impreciso cerca de 180°).
+
+  **Import circular evitado con import local**: `joint_limits.py`
+  importa de `ik_solver.py` (`chain_bone_names`, `name_to_node_index`)
+  a nivel de módulo; `ik_solver.solve_ik_ccd` necesita
+  `signed_hinge_angle_deg` de `joint_limits.py` — un `import` a nivel de
+  módulo en `ik_solver.py` habría creado un ciclo. Se resolvió con un
+  `import` LOCAL dentro del cuerpo de `solve_ik_ccd` (se ejecuta solo al
+  llamar la función, momento en el que ambos módulos ya están
+  completamente cargados, sin importar el orden de import inicial) —
+  patrón estándar para este caso, no una solución improvisada.
+
+  **Algoritmo del recorte, por hueso con eje conocido, ANTES de aplicar
+  la rotación de esta pasada**: (1) `current_total_deg =
+  signed_hinge_angle_deg(...)` del estado actual; (2) `new_total_deg =
+  current_total_deg + grados(signed_angle)` (lo que CCD querría
+  alcanzar sumando el incremento de esta pasada); (3)
+  `new_total_clamped_deg = clip(new_total_deg, -90, 90)`; (4)
+  `actual_delta_rad = radianes(new_total_clamped_deg -
+  current_total_deg)` — el incremento AJUSTADO tras el recorte, el único
+  que se aplica de verdad. Si el hueso ya está en el límite y CCD
+  querría seguir empujando en la misma dirección, `actual_delta_rad` es
+  ~0 y se salta el hueso esta pasada (mismo criterio que ya se usaba
+  para ángulos sin restringir ~0).
+
+  **`backend/tests/test_ik_solver.py`** ampliado con 5 tests nuevos (19
+  en total, antes 14; los 14 originales siguen pasando sin modificarlos
+  — el default preserva compatibilidad):
+
+  1. `test_hinge_angle_cap_still_converges_across_full_cycle`
+     (parametrizado por los 3 modelos, 8 patas × 24 fases): con
+     `hinge_max_angle_deg=90.0`, **0 fallos**, peor caso de iteraciones
+     por pata:
+
+     | pata | max iteraciones (con tope de ángulo) |
+     |---|---|
+     | cow chain_root=31 | 166 |
+     | cow chain_root=33 | 87 |
+     | cow chain_root=27 | 321 |
+     | cow chain_root=3 | **738** ← peor caso, dentro del presupuesto de 1000 |
+     | biped chain_root=5 | 7 |
+     | biped chain_root=88 | 7 |
+     | bat chain_root=17 | 243 |
+     | bat chain_root=15 | 0 |
+
+  2. `test_hinge_angle_cap_has_real_teeth` (cow, `chain_root=27`,
+     `bone_28_13`): resuelve el mismo ciclo (24 fases, amplitud segura)
+     dos veces, con `hinge_max_angle_deg=1000.0` (sin tope efectivo) y
+     con `90.0`, midiendo `signed_hinge_angle_deg` de `bone_28_13` en
+     cada fase con ambos resultados. Números reales medidos: SIN tope
+     efectivo, ángulo máximo `|226.2|°` (secuencia completa por fase:
+     -22.2, 30.4, 55.4, 74.1, 88.7, 99.1, 104.7, **226.2**, -124.3,
+     -111.1, -94.0, -72.2, -38.8, -38.4, -37.5, -34.8, -1.3, 1.8, 0.0,
+     -4.2, -11.5, -19.4, -21.6, -22.1) — confirma el hallazgo, no lo da
+     por hecho. CON tope de 90°, ángulo máximo exactamente `90.0°`
+     (secuencia: mismos valores hasta que se satura en ±90 en las fases
+     donde el sin-tope se disparaba: ..., 88.6, 90.0, 90.0, 90.0, -90.0,
+     -90.0, -90.0, -72.2, ...) — nunca excede `90.0 + 1.0°` (margen de
+     tolerancia numérica del test). Prueba de que el tope tiene dientes
+     de verdad, no un parámetro ignorado en silencio.
+
+  3. `test_hinge_angle_cap_blocks_out_of_range_target` (cow,
+     `chain_root=31`): objetivo con `stride_amplitude_pct=3.0` (300%,
+     muy por encima de la amplitud segura, a propósito) en `phase=0.0`
+     — con `hinge_max_angle_deg=90.0` NO converge
+     (`result.converged is False`, error final medido 5.487, 1000/1000
+     iteraciones agotadas) en vez de exceder el tope para alcanzar el
+     objetivo de todos modos. Confirma que el límite de ángulo tiene
+     PRIORIDAD sobre alcanzar el objetivo cuando entran en conflicto.
+
+  **Verificación visual** (`backend/scripts/_plot_angle_capped_pose_debug.py`,
+  nuevo — extiende el patrón de `_plot_constrained_pose_debug.py` sin
+  tocarlo, añadiendo una TERCERA silueta superpuesta: sin restringir
+  (punteado), solo-eje (discontinuo, `hinge_max_angle_deg=1000.0`) y
+  eje+ángulo≤90° (sólido)): comprobado a ojo sobre los 3 modelos
+  (`samples/_debug/{modelo}_angle_capped_vs_axis_only.png`) — en los 3
+  modelos las 3 siluetas se superponen de cerca en la mayoría de fases,
+  con la variante eje+ángulo divergiendo visiblemente de las otras dos
+  solo en las fases donde el tope satura de verdad (esperado, es
+  precisamente lo que el tope está diseñado para hacer) — ningún doblez
+  descabellado ni trayectoria sin sentido en ninguna pata de los 3
+  modelos.
+
+  **Verificación:** `pytest backend/tests/` completo → **111 passed**,
+  0 failed (106 de antes + 5 nuevos).
+
+  Límite de ÁNGULO dentro de cada bisagra aplicado y verificado. Con
+  esto, el sub-tema de límites articulares (eje + ángulo) del Módulo 3
+  queda cerrado. Todavía pendiente del Módulo 3: resolución del signo
+  de `stride_direction` (qué extremo es "adelante"), y la pose de
+  "asombro".
