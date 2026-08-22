@@ -66,9 +66,13 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   4**: integración de la respiración con el ciclo de marcha activo (sin
   resolver — combinar ambas podría deslizar ligeramente los pies durante
   la fase de apoyo, limitación conocida y aceptada de esta primera pieza,
-  no bloquea seguir con el resto de micro-movimientos); parpadeo; ruido
-  de baja frecuencia en dedos/cola/orejas — ninguno de los dos empezado
-  todavía.
+  no bloquea seguir con el resto de micro-movimientos). Parpadeo:
+  **bloqueo documentado y aceptado** (no pendiente activo — ver
+  checkpoint 2026-08-21 "bloqueo de parpadeo": los 3 GLB de muestra
+  tienen 0 morph targets y ningún esqueleto tiene hueso de párpado,
+  límite duro de los datos de entrada, no un algoritmo por mejorar).
+  Único pendiente activo de Módulo 4: ruido de baja frecuencia en
+  dedos/cola/orejas — sin empezar todavía.
 
 ## Roadmap por módulos
 
@@ -2093,3 +2097,61 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   limitación conocida y aceptada de esta pieza, no resuelta aquí),
   parpadeo, y ruido de baja frecuencia en dedos/cola/orejas — sin
   empezar todavía, espera instrucción atómica.
+
+- **[Módulo 4 — bloqueo de parpadeo] 2026-08-22** — Tarea de SOLO
+  DOCUMENTACIÓN, sin cambios de código: verificación de por qué el
+  parpadeo (párpado cerrándose) no es viable con los assets de prueba
+  actuales, para dejarlo registrado como límite y no reabrir la
+  investigación en el futuro sin releer esto primero.
+
+  **Verificación propia (no aceptado de memoria de un resumen ajeno)**:
+
+  1. Morph targets (blend shapes) en los 3 GLB de muestra — iterando
+     `gltf.meshes[*].primitives[*].targets` con `pygltflib` directamente
+     sobre `samples/{cow,biped,bat}_unrigged.glb`:
+
+     | modelo | nº de meshes | targets por primitiva | total |
+     |---|---|---|---|
+     | cow | 1 | [0, 0, 0] | 0 |
+     | biped | 3 | [0, 0, 0] | 0 |
+     | bat | 2 | [0, 0, 0, 0, 0, 0] | 0 |
+
+     **0 morph targets en los 3 modelos** — confirma exactamente el
+     resultado ya obtenido de forma independiente.
+
+  2. Tamaño de los 3 esqueletos vía `build_skeleton_tree` (mismo pipeline
+     que el resto del proyecto): cow 28 nodos, biped 182 nodos (coincide
+     exactamente con el nº final ya documentado en el checkpoint de
+     cierre del Módulo 1), bat 30 nodos. Ningún módulo existente
+     (`limb_classification.py` ni ningún otro) tiene mecanismo para
+     identificar un "hueso de párpado" — búsqueda directa de
+     `parpado`/`eyelid`/`blink`/`morph` en `backend/app/` sin resultados.
+     Los esqueletos son producto de contracción de malla (Módulo 0/1),
+     sin nombres semánticos de origen autoral que pudieran servir de
+     atajo.
+
+  **Decisión**: el parpadeo real necesita morph targets/blend shapes o
+  un hueso de párpado dedicado — ninguno de los dos existe en los assets
+  de prueba actuales, y ningún módulo de este proyecto produce ni
+  consume morph targets hasta ahora. Es un **límite DURO de los datos de
+  entrada disponibles** (mecanismo que no existe en el dato), de la
+  misma naturaleza — aunque no la misma causa geométrica — que el límite
+  ya documentado y aceptado del signo de `stride_direction` (checkpoint
+  de cierre del Módulo 3): no es un algoritmo pendiente de mejorar, es
+  que la pieza necesaria no está en la entrada.
+
+  Retomar esto en el futuro necesitaría un **módulo de morph targets
+  aparte**, completamente fuera del alcance actual de auto-rigging por
+  huesos — no es "hacerlo mejor" con el enfoque actual, es "hacer otra
+  cosa distinta" (generación/detección de blend shapes faciales, un
+  problema de otra naturaleza que la esqueletización geométrica que usa
+  todo el proyecto hasta ahora).
+
+  El bloqueo de parpadeo queda como **límite documentado y aceptado**,
+  no como pendiente activo — no debe reaparecer en un futuro "Estado
+  actual" como tarea por hacer del Módulo 4.
+
+  Sin cambios de código en esta tarea (verificación con `pygltflib` y
+  `build_skeleton_tree` desde fuera de los tests, sin tocar ningún
+  `.py` del repo). `pytest backend/tests/` sigue en el mismo estado que
+  el checkpoint anterior: **128 passed**, 0 failed.
