@@ -71,8 +71,13 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   checkpoint 2026-08-21 "bloqueo de parpadeo": los 3 GLB de muestra
   tienen 0 morph targets y ningún esqueleto tiene hueso de párpado,
   límite duro de los datos de entrada, no un algoritmo por mejorar).
-  Único pendiente activo de Módulo 4: ruido de baja frecuencia en
-  dedos/cola/orejas — sin empezar todavía.
+  Identificación de apéndices (`appendage_classification.classify_appendages`)
+  y ruido de baja frecuencia (`micro_movements.low_frequency_noise_rotation`)
+  hechos y verificados. **Pendiente dentro de Módulo 4**: conectar todo
+  esto (respiración + ruido de apéndices) a una pose real de un
+  esqueleto completo y verificar visualmente el efecto conjunto — no
+  resuelto en esta tarea, cada pieza se ha verificado por separado
+  hasta ahora.
 
 ## Roadmap por módulos
 
@@ -2155,3 +2160,165 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   `build_skeleton_tree` desde fuera de los tests, sin tocar ningún
   `.py` del repo). `pytest backend/tests/` sigue en el mismo estado que
   el checkpoint anterior: **128 passed**, 0 failed.
+
+- **[Módulo 4 — identificación de apéndices + ruido de baja frecuencia]
+  2026-08-22** — Dos piezas nuevas: `appendage_classification.py`
+  (módulo nuevo) clasifica dedos/cola/orejas sobre los nodos no-pata del
+  esqueleto; `micro_movements.low_frequency_noise_rotation` generaliza
+  `breathing_local_rotation` a un "ruido" de idle no perfectamente
+  periódico, pensado para aplicarse a esas mismas cadenas.
+
+  **Re-derivación propia de los "hallazgos" del director ANTES de
+  escribir nada** (investigados en su propio sandbox, mismo repo/GLB,
+  pero nunca checkpointeados en CLAUDE.md — se verificaron desde cero en
+  vez de darlos por buenos, según lo acordado): confirmados
+  EXACTAMENTE — cow tiene un par casi-espejo exacto en `x=∓0.986`
+  (mismo `y=4.792`, `z=3.955`) → orejas, y una cadena de 4 huesos
+  (`[11,32,4,23,2]`, longitud física 6.022 frente a 3.842 de la
+  siguiente candidata, ratio 1.57x) → cola; bat tiene un par
+  aparentemente espejo (nodos 25/26) que en realidad sube >2 unidades
+  verticales desde la raíz (2.19/2.16 frente a un alcance de pata de
+  solo 0.365) → puntas de ala, no orejas. Único hallazgo previo que NO
+  se sostuvo tal cual: biped tenía "3 hubs con ≥3 hijos no-pata y
+  cadenas cortas" (nodos 45, 262, 264), pero el nodo 45
+  (`pos≈(0,1.68,0)`, casi en el eje central del cuerpo, probablemente
+  boca/mandíbula) es un falso positivo — confirmado con distancia en
+  línea recta a la raíz (0.31, frente a 0.93-0.99 de 262/264, salto de
+  casi 3x) — corregido con un filtro nuevo, no en la investigación
+  original.
+
+  **`appendage_classification.py`** — `limb_chain_nodes(limbs, hierarchy)`
+  extrae a función reutilizable el bucle "de `foot_leaf` a `chain_root`"
+  ya reimplementado ad-hoc en varios scripts de depuración de Módulo 3.
+  `classify_appendages(tree, root, hierarchy, limbs)` devuelve
+  `{"ears": [...], "tail": [...], "fingers": [...]}` (listas de cadenas
+  hoja-a-hub, cualquiera puede quedar vacía), en 4 pasos:
+
+  0. **Exclusión de restos de dedos del pie** (paso añadido, no en el
+     diseño original de la tarea — hallazgo real encontrado
+     implementando, no hipotético): `limb_chain_nodes` usa `foot_leaf`
+     (el único representante que anima `solve_ik_ccd`), no TODOS los
+     `ground_leaves` de una pata — biped tiene patas con hasta 8
+     `ground_leaves` pero 1 solo `foot_leaf`, así que los OTROS 7 dedos
+     del pie aparecen como "hojas no-pata". Varios de ellos son
+     espejo EXACTO entre el pie izquierdo y el derecho (p. ej. nodos
+     2/179, diferencia 0.000 en las 3 coordenadas) — sin filtrarlos se
+     clasificaban como 6 pares de "orejas" en los pies. Filtro: cualquier
+     hoja no-pata con altura Y dentro de `DEFAULT_GROUND_THRESHOLD_PCT`
+     (reutilizado de `limb_classification.py`) de la Y mínima del
+     modelo se excluye de toda clasificación de apéndices. Verificado
+     que no excluye ningún apéndice real de los 3 modelos.
+  1. **Cadenas simples**: por cada hoja no-pata superviviente,
+     `_simple_chain` sube por ancestros no-pata hasta la primera
+     bifurcación no-pata real.
+  2. **Dedos**: hubs con >=3 hijos no-pata (`DEFAULT_FINGER_MIN_NON_LIMB_CHILDREN`),
+     TODAS sus cadenas con <=3 aristas (`DEFAULT_FINGER_MAX_CHAIN_EDGES`
+     — "longitud" medida en aristas, no en nodos, verificado contra la
+     mano real de biped), Y a >=0.15 de la diagonal del modelo en línea
+     recta desde la raíz (`DEFAULT_FINGER_MIN_DISTAL_FRACTION` — filtro
+     nuevo del paso 0 de arriba, calibrado 0.0785 del falso positivo
+     frente a 0.30-0.32 de las manos reales).
+  3. **Orejas**: entre las cadenas restantes, filtro de desplazamiento
+     (distancia hoja-hub en línea recta) <=1.5x
+     (`DEFAULT_EAR_MAX_DISPLACEMENT_TO_REACH_RATIO`) el `reach` de la
+     pata de MAYOR alcance del modelo — **corrección respecto a la
+     sugerencia inicial de la tarea**: se sugería usar
+     `gait_cycle.max_chain_bone_length` (longitud de arco de la pata
+     doblada) como referencia; verificado que NO discrimina (la punta de
+     ala menos extrema de bat da ratio 0.451 con esa referencia, MENOR
+     que las propias orejas de cow en 0.507-0.602 — ningún umbral único
+     serviría). Cambiado a `reach` (línea recta chain_root->foot_leaf,
+     ya usada en `gait_cycle.py`) — comparación coherente porque el
+     desplazamiento del apéndice también es en línea recta; con `reach`
+     sí hay hueco claro (orejas 0.66-0.69x, alas 2.02-3.38x) y el 1.5x
+     sugerido por la tarea separa ambos grupos con margen. Entre las
+     supervivientes, búsqueda de pares que comparten el MISMO hub
+     (bilateral, no cualquier posición especular) — **segunda corrección
+     encontrada implementando**: buscar espejo entre TODAS las hojas sin
+     esta restricción dio **26 pares espurios en biped** (un cuerpo
+     bípedo completo es simétrico izquierda-derecha en casi cualquier
+     detalle de malla, no solo en apéndices reales) — verificado que
+     restringir a mismo-hub (las orejas de cow comparten hub=2
+     exactamente) elimina los 26 falsos positivos sin perder ningún
+     apéndice real.
+  4. **Cola**: entre las cadenas que quedan, la de mayor longitud física
+     si supera a la segunda por >=1.3x (`DEFAULT_TAIL_MIN_OUTLIER_RATIO`);
+     con una sola candidata restante se acepta sin comparación (no hay
+     ambigüedad posible); si no hay ganador claro, vacío.
+
+  **Resultado verificado en los 3 modelos** (coincide con los tests):
+
+  | modelo | ears | tail | fingers |
+  |---|---|---|---|
+  | cow | 2 cadenas (comparten hub=2) | 1 cadena | 0 |
+  | biped | 0 | 0 | 8 cadenas (1 mano — ver limitación abajo) |
+  | bat | 0 | 1 cadena | 3 cadenas (dedos del ala) |
+
+  **Limitación real encontrada y documentada, no oculta**: biped solo
+  tiene la mano IZQUIERDA agrupada bajo hubs con >=3 hijos directos
+  (nodos 262 y 264, en realidad la MISMA mano — 264 es probablemente el
+  pulgar con una bifurcación extra que no se fusiona con el resto,
+  ambos a solo 0.07 de distancia entre sí). La mano DERECHA (dedos con
+  `x` positivo verificados: nodos 112/259, 280/281, 301/303, más 184 y
+  255 sueltos) NO se agrupa bajo ningún hub único — sus dedos se
+  reparten en 5 hubs anidados de 1-2 hijos cada uno, asimetría real del
+  propio pipeline de esqueletización (misma naturaleza que otras
+  asimetrías izquierda/derecha ya documentadas en checkpoints de
+  Módulo 1/3). El test (`test_biped_has_at_least_one_hand`) solo exige
+  "al menos una mano, no asumir cuántas" — tal y como pedía la tarea —
+  así que esto NO es un fallo, pero sí una limitación real de este
+  heurístico frente a un modelo con topología asimétrica, documentada
+  para no sorprender en el futuro.
+
+  **`micro_movements.low_frequency_noise_rotation(t, axis, seed,
+  max_amplitude_deg, base_frequency_hz=0.3)`**: suma 3
+  (`DEFAULT_LOW_FREQUENCY_NOISE_COMPONENTS`) senos de frecuencia y fase
+  derivadas de `seed` vía `np.random.default_rng(seed)` (determinista:
+  mismo `seed` da siempre el mismo resultado, no aleatoriedad real en
+  cada llamada), con pesos iguales (`1/3` cada uno) que garantizan por
+  construcción que la suma nunca excede `[-1,1]`, así que el ángulo
+  final (`max_amplitude_deg · suma`) nunca excede `max_amplitude_deg` —
+  mismo tipo de garantía que `breathing_local_rotation`, pero SIN
+  identidad forzada en `t=0` (las fases son aleatorias por `seed`, no
+  fijas — un ruido de idle no necesita arrancar sincronizado con el
+  resto de la animación, a diferencia de la respiración). `seed`
+  distinto por cadena (p. ej. el nodo hoja de cada dedo/cola/oreja) para
+  que varios apéndices no se muevan idénticos y en fase — verificado
+  explícitamente que dos semillas distintas dan resultados distintos en
+  los mismos instantes de tiempo.
+
+  **`backend/tests/test_appendage_classification.py`** (nuevo, 9 tests):
+  cow con exactamente 2 orejas (mismo hub) y 1 cola;
+  `test_biped_has_at_least_one_hand` (>=3 cadenas, no exige nº exacto de
+  manos); bat con 1 cola y 0 orejas (la prueba que confirma que el
+  filtro de desplazamiento funcionó); disjunción con nodos de pata, y
+  ninguna hoja repetida entre categorías — para los 3 modelos.
+
+  **`backend/tests/test_micro_movements.py`** ampliado con 8 tests
+  nuevos (19 en total, antes 11): amplitud nunca excedida (300 muestras,
+  60s), determinismo (6 valores de `t`, misma llamada = mismo
+  resultado), y que dos semillas distintas dan resultados distintos.
+
+  **Verificación visual** (`backend/scripts/_plot_appendage_debug.py`,
+  nuevo): esqueleto completo coloreado por categoría (rojo=orejas,
+  verde=cola, azul=dedos, naranja=pata, gris=resto). Comprobado a ojo
+  sobre los 3 modelos (`samples/_debug/{modelo}_appendages.png`): cow
+  muestra las orejas (rojo) claramente en la parte alta cerca de la
+  cabeza y la cola (verde) en el extremo opuesto a baja altura, sin
+  cruzarse con ninguna pata; biped muestra los dedos (azul) claramente
+  agrupados en una sola mano en la parte superior izquierda del torso,
+  sin ningún falso positivo de oreja/cola en el resto del esqueleto
+  (gris limpio); bat muestra los dedos del ala (azul) en la punta del
+  ala, la cola (verde) en el extremo opuesto, y ninguna oreja — los 3
+  resultados se leen exactamente como un humano llamaría a esas partes,
+  sin necesidad de ajustar ningún umbral tras esta primera inspección.
+
+  **Verificación:** `pytest backend/tests/` completo → **145 passed**,
+  0 failed (128 de antes + 9 de `test_appendage_classification.py` + 8
+  de `test_micro_movements.py`).
+
+  Identificación de apéndices y ruido de baja frecuencia cerrados y
+  verificados por separado. Pendiente dentro de Módulo 4: conectar
+  respiración + ruido de apéndices a una pose real de un esqueleto
+  completo y verificar visualmente el efecto conjunto — no resuelto en
+  esta tarea.

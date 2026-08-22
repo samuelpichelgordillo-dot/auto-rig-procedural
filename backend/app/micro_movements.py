@@ -93,3 +93,77 @@ def breathing_local_rotation(
     angle_deg = max_amplitude_deg * math.sin(2 * math.pi * breaths_per_second * t)
     angle_rad = math.radians(angle_deg)
     return axis_angle_to_quat(side_axis, angle_rad)
+
+
+# Nº de senos sumados para el ruido de baja frecuencia — 3, ni 2 (se lee
+# demasiado regular/predecible, casi como la propia respiración) ni más
+# (rendimientos decrecientes para "ruido de idle" perceptible en una
+# rotación de amplitud ya de por sí pequeña).
+DEFAULT_LOW_FREQUENCY_NOISE_COMPONENTS = 3
+
+# Los multiplicadores de frecuencia por componente se sortean dentro de
+# este rango alrededor de `base_frequency_hz` — lo bastante separados
+# entre sí para que la suma no colapse en un único seno efectivo (batido
+# casi nulo), lo bastante juntos para que las 3 componentes sigan
+# leyéndose como "una sola cosa moviéndose", no 3 osciladores
+# independientes y desincronizados.
+_FREQUENCY_JITTER_RANGE = (0.7, 1.3)
+
+
+def low_frequency_noise_rotation(
+    t: float,
+    axis: np.ndarray,
+    seed: int,
+    max_amplitude_deg: float,
+    base_frequency_hz: float = 0.3,
+) -> np.ndarray:
+    """Cuaternión de rotación (mismo patrón de uso que
+    `breathing_local_rotation`: componer con la rotación LOCAL de bind
+    pose del hueso objetivo) que representa "ruido" de idle en el
+    instante ``t`` — a diferencia de la respiración (un único seno
+    limpio y predecible), esto debe leerse como el pequeño temblor
+    irregular de un dedo/cola/oreja en reposo, no como una oscilación
+    perfectamente periódica.
+
+    Suma `DEFAULT_LOW_FREQUENCY_NOISE_COMPONENTS` senos de frecuencias y
+    fases ligeramente distintas, derivadas de ``seed`` de forma
+    DETERMINISTA vía ``np.random.default_rng(seed)`` — el generador se
+    crea y se muestrea una sola vez por llamada, así que la MISMA
+    llamada (mismos argumentos) da siempre el MISMO resultado
+    (reproducible, no aleatoriedad real). Las frecuencias se sortean en
+    torno a ``base_frequency_hz`` (rango `_FREQUENCY_JITTER_RANGE`) y las
+    fases uniformemente en `[0, 2π)`.
+
+    Los pesos de cada componente son iguales (`1 / nº de componentes`),
+    así que la suma nunca puede exceder `[-1, 1]` en valor absoluto
+    (cada término aporta como máximo su propio peso, y los pesos suman
+    1) — multiplicado por `max_amplitude_deg`, la amplitud angular total
+    NUNCA excede `max_amplitude_deg`, igual que en `breathing_local_rotation`.
+
+    ``seed`` distinto por cadena (p. ej. el nodo hoja de esa cola/dedo/
+    oreja concreta) para que varios apéndices no se muevan todos
+    exactamente igual y en fase — verificado en
+    `test_low_frequency_noise_seed_changes_result`.
+
+    A diferencia de `breathing_local_rotation`, NO se garantiza
+    identidad en `t=0` (las fases son aleatorias por `seed`, no fijas en
+    0) — no hace falta: el "ruido" de idle no necesita arrancar
+    exactamente en la pose de bind, a diferencia del ciclo de
+    respiración que si empieza desincronizado con el resto de la
+    animación produciría un salto visible en `t=0`.
+    """
+    rng = np.random.default_rng(seed)
+    num_components = DEFAULT_LOW_FREQUENCY_NOISE_COMPONENTS
+    freq_multipliers = rng.uniform(_FREQUENCY_JITTER_RANGE[0], _FREQUENCY_JITTER_RANGE[1], size=num_components)
+    phases = rng.uniform(0.0, 2 * math.pi, size=num_components)
+    frequencies_hz = base_frequency_hz * freq_multipliers
+
+    weight = 1.0 / num_components
+    normalized_signal = sum(
+        weight * math.sin(2 * math.pi * freq * t + phase)
+        for freq, phase in zip(frequencies_hz, phases)
+    )
+
+    angle_deg = max_amplitude_deg * normalized_signal
+    angle_rad = math.radians(angle_deg)
+    return axis_angle_to_quat(axis, angle_rad)

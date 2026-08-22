@@ -21,6 +21,7 @@ from backend.app.micro_movements import (
     DEFAULT_BREATHS_PER_MINUTE,
     DEFAULT_MAX_AMPLITUDE_DEG,
     breathing_local_rotation,
+    low_frequency_noise_rotation,
 )
 from backend.app.skeletonization import build_skeleton_tree
 
@@ -116,3 +117,54 @@ def test_breathing_displacement_is_subtle(tree_and_limbs_by_model, model):
             f"cadena ({max_length:.4f}) — por encima del margen esperado "
             f"({_MAX_SUBTLE_FRACTION * 100:.0f}%), ya no es sutil"
         )
+
+
+# --- low_frequency_noise_rotation (ruido de idle en dedos/cola/orejas) ---
+
+_NOISE_MAX_AMPLITUDE_DEG = 4.0
+_NOISE_AXIS = np.array([0.0, 0.0, 1.0])
+
+
+def test_low_frequency_noise_amplitude_never_exceeds_max():
+    num_samples = 300
+    t_values = [i / num_samples * 60.0 for i in range(num_samples)]  # 60s, varios periodos
+
+    max_angle = 0.0
+    for t in t_values:
+        quat = low_frequency_noise_rotation(t, _NOISE_AXIS, seed=1, max_amplitude_deg=_NOISE_MAX_AMPLITUDE_DEG)
+        angle = _rotation_angle_deg(quat)
+        max_angle = max(max_angle, angle)
+
+    assert max_angle <= _NOISE_MAX_AMPLITUDE_DEG + 1e-6, (
+        f"ángulo máximo observado {max_angle} excede max_amplitude_deg "
+        f"({_NOISE_MAX_AMPLITUDE_DEG})"
+    )
+
+
+@pytest.mark.parametrize("t", [0.0, 0.3, 1.7, 3.14, 5.0, 10.25])
+def test_low_frequency_noise_is_deterministic(t):
+    """Misma llamada (mismos argumentos, incluido `seed`) debe dar
+    siempre el MISMO resultado — reproducible, no aleatoriedad real en
+    cada invocación."""
+    quat_a = low_frequency_noise_rotation(t, _NOISE_AXIS, seed=42, max_amplitude_deg=_NOISE_MAX_AMPLITUDE_DEG)
+    quat_b = low_frequency_noise_rotation(t, _NOISE_AXIS, seed=42, max_amplitude_deg=_NOISE_MAX_AMPLITUDE_DEG)
+    np.testing.assert_array_equal(quat_a, quat_b)
+
+
+def test_low_frequency_noise_seed_changes_result():
+    """`seed` distinto por cadena (dedo/cola/oreja) debe dar resultados
+    distintos — para que varios apéndices no se muevan todos exactamente
+    igual y en fase."""
+    t_values = [0.5, 2.3, 7.1, 15.0]
+    quats_seed_a = [
+        low_frequency_noise_rotation(t, _NOISE_AXIS, seed=1, max_amplitude_deg=_NOISE_MAX_AMPLITUDE_DEG)
+        for t in t_values
+    ]
+    quats_seed_b = [
+        low_frequency_noise_rotation(t, _NOISE_AXIS, seed=2, max_amplitude_deg=_NOISE_MAX_AMPLITUDE_DEG)
+        for t in t_values
+    ]
+
+    assert any(
+        not np.allclose(qa, qb, atol=1e-6) for qa, qb in zip(quats_seed_a, quats_seed_b)
+    ), "seed=1 y seed=2 dieron resultados idénticos en todos los t muestreados"
