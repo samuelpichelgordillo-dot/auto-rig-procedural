@@ -42,7 +42,7 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
 
 ## Estado actual
 
-- **Módulo actual:** 4 — Micro-movimientos (siguiente, aún sin empezar)
+- **Módulo actual:** 4 — Micro-movimientos (en curso)
 - **Estado:** Módulos 0, 1, 2 y 3 completados y verificados. Módulo 3
   (animación procedural básica) **CERRADO** 2026-08-21: clasificación de
   patas de apoyo (`limb_classification.classify_support_limbs`) + IK CCD
@@ -59,9 +59,16 @@ fase de pulido, una vez tengamos casos reales fallidos con los que evaluar.
   PERMANENTE de este enfoque geométrico (investigado y documentado, no
   pendiente — ver checkpoint 2026-08-21 "signo de stride_direction,
   decisión de no perseguirlo"), no bloquea el cierre del módulo porque
-  ninguna pieza construida depende de resolverlo. Empieza Módulo 4:
-  micro-movimientos (respiración, parpadeo, ruido de baja frecuencia en
-  dedos/cola/orejas) — sin empezar todavía, espera instrucción atómica.
+  ninguna pieza construida depende de resolverlo. Módulo 4
+  (micro-movimientos) en curso: respiración
+  (`micro_movements.breathing_local_rotation`, rotación sinusoidal de la
+  raíz del esqueleto) hecha y verificada. **Pendiente dentro de Módulo
+  4**: integración de la respiración con el ciclo de marcha activo (sin
+  resolver — combinar ambas podría deslizar ligeramente los pies durante
+  la fase de apoyo, limitación conocida y aceptada de esta primera pieza,
+  no bloquea seguir con el resto de micro-movimientos); parpadeo; ruido
+  de baja frecuencia en dedos/cola/orejas — ninguno de los dos empezado
+  todavía.
 
 ## Roadmap por módulos
 
@@ -1962,3 +1969,127 @@ Formato: `[Módulo N] fecha — resumen de qué se hizo y qué decisiones se tom
   Empieza Módulo 4 — micro-movimientos: respiración, parpadeo, ruido de
   baja frecuencia en dedos/cola/orejas. Sin empezar todavía, espera
   instrucción atómica del director técnico-creativo.
+
+- **[Módulo 4 — respiración] 2026-08-21** — Primera pieza de Módulo 4:
+  `backend/app/micro_movements.py` (nuevo módulo),
+  `breathing_local_rotation(t, side_axis, breaths_per_minute=15.0,
+  max_amplitude_deg=1.5)` — cuaternión de rotación sinusoidal MUY
+  pequeña, pensado para componerse con la rotación LOCAL de bind pose de
+  la RAÍZ del esqueleto (`skin_data.root_node_index`).
+
+  **Por qué la raíz entera y no un hueso de "pecho" específico**: se
+  descartó explícitamente (decisión ya tomada con el director, no
+  reabierta) por el mismo motivo ya documentado para el signo de
+  `stride_direction` — heurísticos de ramificación son frágiles.
+  Comprobado también aquí antes de descartarlo: seguir "la rama con más
+  descendientes no-pata" desde la raíz se desvía hacia brazos/cabeza
+  (alta ramificación de dedos) en vez de seguir la columna real. La
+  respiración es, en cambio, una aproximación deliberada de "balanceo
+  sutil de todo el torso" rotando la raíz entera — documentada como tal,
+  no como animación anatómica precisa de caja torácica.
+
+  **Por qué `skin_data.root_node_index` y no el nodo raíz TOPOLÓGICO del
+  árbol de esqueleto (`build_skeleton_tree`)**: son nodos DISTINTOS.
+  `skin_data.root_node_index` es el nodo "SkeletonArmature" del glTF
+  exportado — el ancestro común de todos los huesos (y de los nodos de
+  malla, "Cow"/"Eyes"/etc., que cuelgan como hermanos de los huesos de
+  nivel superior) — mismo nodo que ya usa
+  `test_hinge_axis_co_rotates_with_ancestor_perturbation`
+  (`test_joint_limits.py`, Módulo 3) para simular una perturbación del
+  "ancestro común de toda la pata". El nodo raíz topológico del árbol de
+  esqueleto (p. ej. nodo `2` en cow), en cambio, no es un nodo del glTF
+  en sí — es solo la CABEZA compartida de varios huesos "bone_2_X" que
+  cuelgan directamente de `root_node_index` (ver checkpoint del Módulo 3
+  sobre exclusión del pivote de cadera: cada extremidad tiene su propio
+  hueso "bone_2_X", no hay un único hueso que "sea" el nodo topológico
+  raíz). Rotar `root_node_index` mueve el marco de referencia de TODOS
+  ellos a la vez, que es justo el efecto de "balanceo de todo el cuerpo"
+  buscado.
+
+  **Verificación de la calibración de `max_amplitude_deg=1.5`, con
+  datos reales de los 3 modelos (no dada por hecho de memoria)**:
+  desplazamiento aproximado en la posición del pie ≈
+  `radians(max_amplitude_deg) · (dist_raíz_a_chain_root +
+  max_chain_bone_length)` (usa `gait_cycle.max_chain_bone_length`, ya
+  verificado en Módulo 3), comparado contra la longitud de cadena de esa
+  misma pata:
+
+  | pata | dist_raíz→chain_root | max_chain_length | desplazamiento | % de la longitud de cadena |
+  |---|---|---|---|---|
+  | cow chain_root=31 | 5.031 | 3.768 | 0.230 | 6.11% |
+  | cow chain_root=33 | 5.031 | 4.663 | 0.254 | 5.44% |
+  | cow chain_root=27 | 0.556 | 3.992 | 0.119 | 2.98% |
+  | cow chain_root=3 | 0.837 | 3.940 | 0.125 | 3.17% |
+  | biped chain_root=5 | 0.746 | 1.217 | 0.051 | 4.22% |
+  | biped chain_root=88 | 0.594 | 1.394 | 0.052 | 3.73% |
+  | bat chain_root=17 | 1.270 | 1.635 | 0.076 | 4.65% |
+  | bat chain_root=15 | 1.584 | 1.584 | 0.083 | 5.24% |
+
+  Rango real 2.98%-6.11% en las 8 patas — coincide con lo esperado
+  (5-8%, algo conservador incluso) y queda claramente por debajo de las
+  amplitudes de zancada normales (30%+ de la misma referencia, ver
+  `gait_cycle.foot_target_at_phase`). `test_breathing_displacement_is_subtle`
+  usa un margen del 15% (generoso sobre el 6.11% máximo observado) para
+  que una regresión real en un modelo futuro falle en vez de pasar en
+  silencio.
+
+  **`breaths_per_minute=15.0`**: valor único, NO calibrado por especie
+  — documentado como simplificación deliberada, ya que el proyecto no
+  tiene ninguna fuente de datos biológicos por especie; inventar un
+  número distinto por modelo sería fingir precisión zoológica sin base
+  real. Un valor único razonable de "reposo tranquilo" es más honesto.
+
+  **`backend/tests/test_micro_movements.py`** (nuevo archivo, 11
+  tests): `test_breathing_amplitude_never_exceeds_max` (≥50 valores de
+  `t` en 3 periodos completos, ángulo extraído vía `2·arccos(|w|)`
+  nunca excede `max_amplitude_deg`); `test_breathing_is_periodic`
+  (6 valores de `t`, `breathing_local_rotation(t)` y
+  `breathing_local_rotation(t + periodo)` dan el mismo cuaternión o su
+  negado); `test_breathing_identity_at_t_zero` (cuaternión exacto
+  `[0,0,0,1]` en `t=0`, tolerancia 1e-12); y
+  `test_breathing_displacement_is_subtle` (parametrizado por los 3
+  modelos, la tabla de arriba reproducida como test, no solo como
+  checkpoint).
+
+  **Limitación conocida y ACEPTADA de esta pieza (documentada, no
+  resuelta aquí)**: esta función NO integra todavía con el ciclo de
+  marcha activo. Combinar la rotación de la raíz con
+  `solve_gait_cycle_pose` sin más podría deslizar ligeramente los pies
+  durante la fase de "stance" (el objetivo de IK del pie no cambia, pero
+  el origen de la cadena sí se mueve al rotar la raíz). Queda pendiente
+  para una integración posterior — no bloquea seguir con el resto de
+  Módulo 4 (parpadeo, ruido de baja frecuencia en dedos/cola/orejas),
+  que no dependen de esto.
+
+  **Verificación visual** (`backend/scripts/_plot_breathing_debug.py`,
+  nuevo): aplica `breathing_local_rotation` a la rotación de bind pose
+  de la raíz en 6 instantes repartidos en un periodo completo,
+  recalcula posiciones de todos los huesos vía `compute_global_matrices`
+  y dibuja la silueta completa superpuesta. Primer intento con vista
+  cruda (X, Y) para cow dio un aspecto visualmente alarmante (patas y
+  cuernos cruzados en forma de "X", con una silueta pareciendo
+  "distorsionada" en el instante de mayor amplitud) — investigado ANTES
+  de aceptarlo como problema: confirmado numéricamente que el
+  desplazamiento máximo real entre bind pose y el instante más extremo
+  es de solo **0.14** unidades (sobre un modelo de ~5 unidades de alto),
+  y que la MISMA silueta en forma de "X" aparece renderizando SOLO bind
+  pose sin ninguna respiración — es el aspecto NORMAL del esqueleto de
+  cow proyectado en el plano (X, Y) crudo (X no es el eje principal de
+  extensión corporal de cow), no una distorsión introducida por la
+  tarea. Corregido cambiando la proyección a
+  (`stride_direction`, Y) — mismo criterio ya usado en
+  `_plot_surprise_pose_debug.py` — para una vista lateral legible.
+  Comprobado a ojo sobre los 3 modelos
+  (`samples/_debug/{modelo}_breathing.png`): en los 3, las 6 siluetas se
+  superponen casi exactamente, con una variación gradual y apenas
+  perceptible entre instantes — ningún salto brusco, ninguna pose
+  descolocada, consistente con la calibración de arriba.
+
+  **Verificación:** `pytest backend/tests/` completo → **128 passed**,
+  0 failed (117 de antes + 11 nuevos de `test_micro_movements.py`).
+
+  Respiración cerrada y verificada. Pendiente dentro de Módulo 4:
+  integración con locomoción activa (evitar deslizamiento de pies,
+  limitación conocida y aceptada de esta pieza, no resuelta aquí),
+  parpadeo, y ruido de baja frecuencia en dedos/cola/orejas — sin
+  empezar todavía, espera instrucción atómica.
